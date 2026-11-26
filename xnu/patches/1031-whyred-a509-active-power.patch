@@ -1,0 +1,337 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -230,6 +230,272 @@
+     lck_mtx_unlock(&wgpu_lock);
+     printf("A509: BOOT_PROBE_END (no CP upload or acceleration)\n");
+ }
++
++/* SDM636 A509 active power stage. Source: whyred live DT (GPUCC, GDSC,
++ * msm_gfx_ldo), Qualcomm downstream gpucc-sdm660.c, gdsc-regulator.c,
++ * msm_gfx_ldo.c and clk-rcg2.c. Never change shared RPM votes. Start at XO.
++ * GPU DMA / secure registers / renderer deliberately not touched here.
++ */
++#define WA509_LDO_PAGE 0x0506c000UL
++#define WA509_LDO_CTL  0x201cU
++#define WA509_CX_HW   0x2008U
++#define WA509_TIMER   0x20d0U
++#define WA509_TIMER_RCG 0x20b0U
++#define WA509_AON     (0x04d2U * 4U)
++#define WA509_RCG_CFG 4U
++#define WA509_RCG_UPDATE 1U
++#define WA509_RCG_ROOT_EN 2U
++#define WA509_GDSC_HW 2U
++#define WA509_GDSC_COLLAPSE 1U
++#define WA509_LDO_BHS_CLEAR ((1U<<31)|(1U<<9)|(1U<<2)|(1U<<1)|1U)
++#define WA509_LDO_BHS_SET ((1U<<29)|(1U<<4))
++
++/* Only the existing modem RPM request path publishes this result. No new
++ * RPM client, no duplicate resource requests, and no voltage changes. */
++static uint32_t wa509_rails;
++static uint32_t wa509_state;
++static uint32_t wa509_aon0, wa509_aon1;
++
++bool whyred_gpu_rails_ready(void);
++bool
++whyred_gpu_rails_ready(void)
++{
++    return __atomic_load_n(&wa509_rails, __ATOMIC_ACQUIRE) == 3U;
++}
++
++void whyred_gpu_rpm_votes(bool, bool);
++void
++whyred_gpu_rpm_votes(bool cx, bool mx)
++{
++    __atomic_store_n(&wa509_rails, (cx ? 1U : 0U) | (mx ? 2U : 0U), __ATOMIC_RELEASE);
++}
++
++static void
++wa509_set_state(uint32_t s)
++{
++    __atomic_store_n(&wa509_state, s, __ATOMIC_RELEASE);
++    printf("A509: POWER_STATE=%u\n", s);
++}
++
++static bool
++wa509_rmw(vm_offset_t v, uint32_t off, uint32_t clear, uint32_t set)
++{
++    uint32_t old = wgpu_mmio_read(v, off);
++    if (old == 0xffffffffU) return false;
++    uint32_t want = (old & ~clear) | set;
++    if (want != old) wgpu_mmio_write(v, off, want);
++    uint32_t now = wgpu_mmio_read(v, off);
++    return now != 0xffffffffU && (now & (clear | set)) == (want & (clear | set));
++}
++
++static bool
++wa509_poll(vm_offset_t v, uint32_t off, uint32_t mask, uint32_t wanted)
++{
++    for (unsigned i = 0; i < 400; i++) {
++        uint32_t x = wgpu_mmio_read(v, off);
++        if (x != 0xffffffffU && (x & mask) == wanted) return true;
++        delay(10);
++    }
++    return false;
++}
++
++static bool
++wa509_gate(vm_offset_t v, uint32_t off)
++{
++    return wa509_rmw(v, off, 0, 1U) && wa509_poll(v, off, WGATE_OFF, 0);
++}
++
++/* Select 19.2 MHz XO, HID divider 1 (unity), no M/N counter. Only invoked
++ * when the GPU branch and GX are off; never reparent a running GPU. */
++static bool
++wa509_xo_root(vm_offset_t v, uint32_t cmd)
++{
++    if (!wa509_rmw(v, cmd, 0, WA509_RCG_ROOT_EN)) return false;
++    if (!wa509_rmw(v, cmd + WA509_RCG_CFG, 0x371fU, 1U)) return false;
++    uint32_t r = wgpu_mmio_read(v, cmd);
++    if (r == 0xffffffffU) return false;
++    wgpu_mmio_write(v, cmd, r | WA509_RCG_UPDATE);
++    return wa509_poll(v, cmd, WA509_RCG_UPDATE | (1U << 31), 0);
++}
++
++static void
++wa509_restore_root(vm_offset_t v, uint32_t cmd, uint32_t old_cmd, uint32_t old_cfg)
++{
++    if (!wa509_rmw(v, cmd + 4, 0x371fU, old_cfg & 0x371fU)) return;
++    uint32_t r = wgpu_mmio_read(v, cmd);
++    if (r == 0xffffffffU) return;
++    wgpu_mmio_write(v, cmd, r | WA509_RCG_UPDATE);
++    if (wa509_poll(v, cmd, WA509_RCG_UPDATE, 0))
++        (void)wa509_rmw(v, cmd, WA509_RCG_ROOT_EN, old_cmd & WA509_RCG_ROOT_EN);
++}
++
++static bool
++wa509_gdsc_on(vm_offset_t v, uint32_t off)
++{
++    uint32_t r = wgpu_mmio_read(v, off);
++    if (r == 0xffffffffU || (r & WA509_GDSC_HW)) return false;
++    if (!wa509_rmw(v, off, WA509_GDSC_COLLAPSE, 0)) return false;
++    delay(1);
++    return wa509_poll(v, off, WGPU_PWR_ON, WGPU_PWR_ON);
++}
++
++/* Restore only clock votes newly taken by this function, and only when GX
++ * has been confirmed collapsed. Do not shut down a pre-existing domain. */
++static void
++wa509_drop_gate(vm_offset_t v, uint32_t off, uint32_t original)
++{
++    if (original != 0xffffffffU && !(original & 1U))
++        (void)wa509_rmw(v, off, 1U, 0);
++}
++
++bool whyred_gpu_power_on(void);
++bool
++whyred_gpu_power_on(void)
++{
++    uint32_t enabled = 0;
++    if (!wgpu_enabled() || !PE_parse_boot_argn("whyred_gpu_power", &enabled, sizeof(enabled)) || enabled != 1)
++        return false;
++    if (!whyred_gpu_rails_ready()) {
++        wa509_set_state(101); /* no acknowledged pre-existing CX/MX votes */
++        return false;
++    }
++    if (!wgpu_boot_firmware()) { wa509_set_state(102); return false; }
++    lck_mtx_lock(&wgpu_lock);
++    if (wgcc == 0) wgcc = ml_io_map(WGCC_PAGE, WGCC_SIZE);
++    vm_offset_t cc = 0, ldo = 0, gpu = 0;
++    uint32_t old_a = 0xffffffffU, old_b = 0xffffffffU, old_c = 0xffffffffU;
++    uint32_t old_xo = 0xffffffffU, old_cx = 0xffffffffU, old_gx = 0xffffffffU;
++    uint32_t old_gfx = 0xffffffffU, old_timer = 0xffffffffU;
++    uint32_t old_root = 0xffffffffU, old_troot = 0xffffffffU;
++    uint32_t old_cfg = 0xffffffffU, old_tcfg = 0xffffffffU, old_ldo = 0xffffffffU;
++    bool root_changed = false, timer_changed = false, ldo_changed = false;
++    uint32_t failure = 103;
++    bool own_cx = false, own_gx = false, safe = false, ok = false;
++    wa509_set_state(1);
++    if (!wgcc) goto out;
++    old_a = wgpu_mmio_read(wgcc, WGCC_AHB);
++    old_b = wgpu_mmio_read(wgcc, WGCC_BIMC);
++    old_c = wgpu_mmio_read(wgcc, WBIMC_GFX);
++    if (old_a == 0xffffffffU || old_b == 0xffffffffU || old_c == 0xffffffffU) goto out;
++    if (!wa509_gate(wgcc, WGCC_AHB) || !wa509_gate(wgcc, WGCC_BIMC) || !wa509_gate(wgcc, WBIMC_GFX)) goto out;
++    failure = 104;
++    cc = ml_io_map(WGPUCC_BASE, WGPUCC_SIZE);
++    if (!cc) goto out;
++    old_xo = wgpu_mmio_read(cc, WGPUCC_CXO);
++    old_cx = wgpu_mmio_read(cc, WGPUCC_CX);
++    old_gx = wgpu_mmio_read(cc, WGPUCC_GX);
++    old_gfx = wgpu_mmio_read(cc, WGPUCC_GFX3D);
++    old_timer = wgpu_mmio_read(cc, WA509_TIMER);
++    if (old_xo == 0xffffffffU || old_cx == 0xffffffffU || old_gx == 0xffffffffU || old_gfx == 0xffffffffU || old_timer == 0xffffffffU) goto out;
++    /* Existing GX ownership is unknown. Do not reset or reparent it. */
++    if (old_gx & WGPU_PWR_ON) { failure = 105; goto out; }
++    if (!(old_gx & WA509_GDSC_COLLAPSE) || (old_gx & WA509_GDSC_HW) || (old_cx & WA509_GDSC_HW) || !(old_gfx & WGATE_OFF) || !(old_timer & WGATE_OFF)) { failure = 106; goto out; }
++    if (!(old_cx & WGPU_PWR_ON) && !(old_cx & WA509_GDSC_COLLAPSE)) { failure = 106; goto out; }
++    safe = true;
++    failure = 107;
++    if (!wa509_gate(cc, WGPUCC_CXO)) goto out;
++    own_cx = !(old_cx & WGPU_PWR_ON) && (old_cx & WA509_GDSC_COLLAPSE);
++    if (!wa509_gdsc_on(cc, WGPUCC_CX)) goto out;
++    wa509_set_state(2);
++    /* Live DT forbids LDO mode for every GFX corner and uses a stub parent.
++     * Configure only the stock BHS control path; leave analog trims, VREF,
++     * CPR fuses, MEM ACC and all shared supply voltages unchanged. */
++    failure = 108;
++    ldo = ml_io_map(WA509_LDO_PAGE, 0x4000);
++    if (!ldo) goto out;
++    old_ldo = wgpu_mmio_read(ldo, WA509_LDO_CTL);
++    if (old_ldo == 0xffffffffU) goto out;
++    ldo_changed = true;
++    if (!wa509_rmw(ldo, WA509_LDO_CTL, WA509_LDO_BHS_CLEAR, WA509_LDO_BHS_SET)) goto out;
++    failure = 109;
++    old_root = wgpu_mmio_read(cc, WGPUCC_RCG);
++    old_cfg = wgpu_mmio_read(cc, WGPUCC_RCG + 4);
++    old_troot = wgpu_mmio_read(cc, WA509_TIMER_RCG);
++    old_tcfg = wgpu_mmio_read(cc, WA509_TIMER_RCG + 4);
++    if (old_root == 0xffffffffU || old_cfg == 0xffffffffU || old_troot == 0xffffffffU || old_tcfg == 0xffffffffU || (old_root & 1U) || (old_troot & 1U)) goto out;
++    root_changed = true;
++    if (!wa509_xo_root(cc, WGPUCC_RCG)) goto out;
++    timer_changed = true;
++    if (!wa509_xo_root(cc, WA509_TIMER_RCG)) goto out;
++    /* Vendor gdsc_enable(): assert/deassert BCR, GMEM reset, unclamp,
++     * clear SW_COLLAPSE, then wait for power-on. */
++    failure = 110;
++    if (!wa509_rmw(cc, WGPUCC_GX_RESET, 0, 1U)) goto out;
++    delay(1);
++    if (!wa509_rmw(cc, WGPUCC_GX_RESET, 1U, 0)) goto out;
++    if (!wa509_rmw(cc, WGPUCC_CLAMP, 0, 1U << 4)) goto out;
++    delay(1);
++    if (!wa509_rmw(cc, WGPUCC_CLAMP, 1U << 4, 0) || !wa509_rmw(cc, WGPUCC_CLAMP, 1U, 0)) goto out;
++    own_gx = true;
++    if (!wa509_gdsc_on(cc, WGPUCC_GX)) goto out;
++    wa509_set_state(3);
++    delay(2);
++    failure = 111;
++    if (!wa509_gate(cc, WGPUCC_GFX3D) || !wa509_gate(cc, WA509_TIMER)) goto out;
++    failure = 112;
++    gpu = ml_io_map(WGPU_MMIO, WGPU_MMIO_SIZE);
++    if (!gpu) goto out;
++    uint32_t aon0 = wgpu_mmio_read(gpu, WA509_AON);
++    delay(1000);
++    uint32_t aon1 = wgpu_mmio_read(gpu, WA509_AON);
++    __atomic_store_n(&wa509_aon0, aon0, __ATOMIC_RELAXED);
++    __atomic_store_n(&wa509_aon1, aon1, __ATOMIC_RELAXED);
++    printf("A509: GX ON, XO 19200000, AON=%08x -> %08x\n", aon0, aon1);
++    if (aon0 == 0xffffffffU || aon1 == 0xffffffffU || aon0 == aon1) goto out;
++    ok = true;
++    wa509_set_state(4);
++    printf("A509: CORE_CLOCK_RUNNING (no GPU DMA or rendering yet)\n");
++out:
++    if (!ok) {
++        wa509_set_state(failure);
++        /* Never power off a domain which was on before our attempt. If
++         * the GX state cannot be established, keep votes rather than
++         * switch off a live domain underneath the hardware. */
++        if (cc && safe) {
++            if (own_gx) {
++                (void)wa509_rmw(cc, WGPUCC_GX, 0, WA509_GDSC_COLLAPSE);
++                safe = wa509_poll(cc, WGPUCC_GX, WGPU_PWR_ON, 0);
++                if (safe) (void)wa509_rmw(cc, WGPUCC_CLAMP, 0, 1U);
++            }
++            if (safe) {
++                wa509_drop_gate(cc, WGPUCC_GFX3D, old_gfx);
++                wa509_drop_gate(cc, WA509_TIMER, old_timer);
++                if (root_changed) wa509_restore_root(cc, WGPUCC_RCG, old_root, old_cfg);
++                if (timer_changed) wa509_restore_root(cc, WA509_TIMER_RCG, old_troot, old_tcfg);
++                if (ldo_changed) (void)wa509_rmw(ldo, WA509_LDO_CTL,
++                    WA509_LDO_BHS_CLEAR | WA509_LDO_BHS_SET,
++                    old_ldo & (WA509_LDO_BHS_CLEAR | WA509_LDO_BHS_SET));
++                if (own_cx) {
++                    (void)wa509_rmw(cc, WGPUCC_CX, 0, WA509_GDSC_COLLAPSE);
++                    safe = wa509_poll(cc, WGPUCC_CX, WGPU_PWR_ON, 0);
++                }
++                if (safe) wa509_drop_gate(cc, WGPUCC_CXO, old_xo);
++            }
++        }
++        if (safe && wgcc) {
++            wa509_drop_gate(wgcc, WBIMC_GFX, old_c);
++            wa509_drop_gate(wgcc, WGCC_BIMC, old_b);
++            wa509_drop_gate(wgcc, WGCC_AHB, old_a);
++        }
++        printf("A509: POWER_STAGE_FAILED stage=%u; clocks may remain voted; reboot to reset\n", failure);
++    }
++    lck_mtx_unlock(&wgpu_lock);
++    return ok;
++}
++
++static int
++wa509_power_status SYSCTL_HANDLER_ARGS
++{
++    char out[180];
++    if (req->newptr) return EPERM;
++    snprintf(out, sizeof(out), "A509 state=%u rails=%u AON=%08x:%08x (power stage only)",
++        __atomic_load_n(&wa509_state, __ATOMIC_ACQUIRE),
++        __atomic_load_n(&wa509_rails, __ATOMIC_ACQUIRE),
++        __atomic_load_n(&wa509_aon0, __ATOMIC_RELAXED), __atomic_load_n(&wa509_aon1, __ATOMIC_RELAXED));
++    return SYSCTL_OUT(req, out, strlen(out) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_power_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, wa509_power_status, "A", "A509 active power state; not rendering status");
+ 
+ static int
+ wgpu_firmware SYSCTL_HANDLER_ARGS
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1319,6 +1319,29 @@
+         ok ? "BUFFER_PREP_PASS" : "BUFFER_PREP_FAIL");
+ }
+ 
++extern "C" bool whyred_gpu_power_on(void);
++extern "C" bool whyred_gpu_rails_ready(void);
++
++/* Run outside topaz_adreno_init; give the modem RPM path and boot services
++ * time to settle. This does not disable USB, RAM, display or any driver. */
++static void
++whyred_a509_power_thread(__unused void *param, __unused wait_result_t wr)
++{
++    IOSleep(45000);
++    for (unsigned i = 0; i < 120 && !whyred_gpu_rails_ready(); ++i) IOSleep(1000);
++    (void)whyred_gpu_power_on();
++}
++
++static void
++whyred_a509_start_power(void)
++{
++    uint32_t on = 0;
++    if (!PE_parse_boot_argn("whyred_gpu_power", &on, sizeof(on)) || on != 1) return;
++    thread_t thread;
++    if (kernel_thread_start(whyred_a509_power_thread, NULL, &thread) == KERN_SUCCESS)
++        thread_deallocate(thread);
++}
++
+ extern "C" void whyred_gpu_boot_probe(void);
+ 
+ void
+@@ -1329,6 +1352,7 @@
+ 	if (PE_parse_boot_argn("whyred_gpu", &whyred_gpu, sizeof(whyred_gpu)) && whyred_gpu != 0) {
+ 		whyred_gpu_boot_probe();
+ 		whyred_a509_buffer_probe();
++		whyred_a509_start_power();
+ 		return;
+ 	}
+ 	uint32_t on = 0, mhz = 0;
+diff --git a/iokit/Kernel/arm/TopazModem.cpp b/iokit/Kernel/arm/TopazModem.cpp
+--- a/iokit/Kernel/arm/TopazModem.cpp
++++ b/iokit/Kernel/arm/TopazModem.cpp
+@@ -7530,6 +7530,8 @@
+  * says it holds its own; here they stay for the session. Suspected: modem diag starves on an
+  * unclocked QDSS.
+  */
++extern "C" void whyred_gpu_rpm_votes(bool, bool);
++
+ static void
+ mss_proxy_votes(void)
+ {
+@@ -7541,6 +7543,7 @@
+ 	bool cx = rpm_request(0, 0x78637772, 0, lvl, 1);                    /* "rwcx" */
+ 	bool mx = rpm_request(0, 0x786d7772, 0, lvl, 1);                    /* "rwmx" */
+ 	bool qd = rpm_request(0, 0x306b6c63, 1, qdss, 1);                   /* "clk0" 1 = qdss */
++	whyred_gpu_rpm_votes(cx, mx);
+ 	LOG("rpm: MSS proxy votes: cx %s, mx %s, qdss %s", cx ? "ok" : "FAILED", mx ? "ok" : "FAILED", qd ? "ok" : "FAILED");
+ }
+ 
