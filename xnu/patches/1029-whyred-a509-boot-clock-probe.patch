@@ -1,0 +1,171 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -78,6 +78,148 @@
+     if (len == 0 || len > 1024U * 1024U) return EINVAL;
+     *size = len;
+     return 0;
++}
++
++
++/* Boot-time A509 phase 3. Register offsets in Linux v6.12 gcc-sdm660.c,
++ * gpucc-sdm660.c and registers/adreno/a5xx.xml; physical bases in live FDT.
++ * Mode 1 observes; mode 2 may temporarily vote only GCC_GPU_CFG_AHB_CLK.
++ * Never touch GX/CX collapse, regulators, PLLs, GPU DMA or CP registers by writes.
++ */
++#define WGCC_ON (1U << 0)
++#define WGPUCC_BASE 0x05064000UL /* 16K aligned; controller at +0x1000 */
++#define WGPUCC_SIZE 0x8000UL
++#define WGPUCC_CX 0x2004U
++#define WGPUCC_GX 0x2094U
++#define WGPUCC_CXO 0x2020U
++#define WGPUCC_GFX3D 0x2098U
++#define WGPUCC_RCG 0x2070U
++#define WGPUCC_CLAMP 0x1130U
++#define WGPUCC_GX_RESET 0x2090U
++#define WGPU_PWR_ON (1U << 31)
++#define WGPU_MMIO 0x05000000UL
++#define WGPU_MMIO_SIZE 0x4000UL
++
++static uint32_t
++wgpu_mmio_read(vm_offset_t base, uint32_t off)
++{
++    return *(volatile uint32_t *)(base + off);
++}
++
++static void
++wgpu_mmio_write(vm_offset_t base, uint32_t off, uint32_t value)
++{
++    *(volatile uint32_t *)(base + off) = value;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* Bounded polling of the clock status, not a guarantee against a fabric abort. */
++static bool
++wgpu_wait_gate(vm_offset_t base, uint32_t off, bool enabled)
++{
++    for (unsigned n = 0; n < 200; n++) {
++        uint32_t v = wgpu_mmio_read(base, off);
++        if (v != 0xffffffffU && ((v & WGATE_OFF) == 0) == enabled) return true;
++        delay(10);
++    }
++    return false;
++}
++
++static bool
++wgpu_boot_firmware(void)
++{
++    static const char *const names[] = {
++        "a530_pm4.fw", "a530_pfp.fw", "a512_zap.mdt", "a512_zap.b00", "a512_zap.b01", "a512_zap.b02"
++    };
++    bool all = true;
++    for (unsigned i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
++        const void *data = NULL;
++        size_t size = 0;
++        int err = wgpu_adt_firmware(names[i], &data, &size);
++        if (!err && i < 2 && (size < 8 || (size & 3))) err = EINVAL;
++        if (!err && i == 2 && (size < 52 || memcmp(data, "\177ELF\1\1", 6) != 0)) err = EINVAL;
++        if (err) all = false;
++        printf("A509: ADT %s bytes=%lu errno=%d\n", names[i], (unsigned long)size, err);
++    }
++    return all;
++}
++
++void whyred_gpu_boot_probe(void);
++void
++whyred_gpu_boot_probe(void)
++{
++    uint32_t mode = 1;
++    static bool ran;
++    if (!wgpu_enabled() || ran) return;
++    ran = true;
++    (void)PE_parse_boot_argn("whyred_gpu_boot", &mode, sizeof(mode));
++    if (mode == 0 || mode > 2) return;
++    printf("A509: BOOT_PROBE_BEGIN mode=%u (no GPU DMA)\n", mode);
++    if (!wgpu_boot_firmware()) {
++        printf("A509: STOP missing/invalid ADT firmware\n");
++        return;
++    }
++    printf("A509: ADT_FIRMWARE_PASS (format only)\n");
++    lck_mtx_lock(&wgpu_lock);
++    if (wgcc == 0) wgcc = ml_io_map(WGCC_PAGE, WGCC_SIZE);
++    if (wgcc == 0) {
++        printf("A509: STOP GCC map failed\n");
++        goto done;
++    }
++    uint32_t a = wgpu_read(WGCC_AHB), b = wgpu_read(WGCC_BIMC), c = wgpu_read(WBIMC_GFX);
++    bool changed = false;
++    printf("A509: GCC before cfg_ahb=%08x gpu_bimc=%08x bimc_gfx=%08x\n", a,b,c);
++    if (a == 0xffffffffU || b == 0xffffffffU || c == 0xffffffffU) {
++        printf("A509: STOP invalid GCC read\n");
++        goto done;
++    }
++    if ((a & WGATE_OFF) && mode == 2 && !(a & WGCC_ON)) {
++        printf("A509: enabling GCC cfg_ahb vote only\n");
++        changed = true;
++        wgpu_mmio_write(wgcc, WGCC_AHB, a | WGCC_ON);
++        bool ready = wgpu_wait_gate(wgcc, WGCC_AHB, true);
++        printf("A509: GCC cfg_ahb result=%08x ready=%u\n", wgpu_read(WGCC_AHB), (unsigned)ready);
++    }
++    uint32_t gate = wgpu_read(WGCC_AHB);
++    if (gate == 0xffffffffU || (gate & WGATE_OFF)) {
++        printf("A509: STOP cfg_ahb unavailable\n");
++        goto restore;
++    }
++    printf("A509: GCC_AHB_READY; mapping GPUCC\n");
++    vm_offset_t cc = ml_io_map(WGPUCC_BASE, WGPUCC_SIZE);
++    if (!cc) {
++        printf("A509: STOP GPUCC map failed\n");
++        goto restore;
++    }
++    uint32_t cx = wgpu_mmio_read(cc,WGPUCC_CX), gx = wgpu_mmio_read(cc,WGPUCC_GX);
++    uint32_t xo = wgpu_mmio_read(cc,WGPUCC_CXO), gfx = wgpu_mmio_read(cc,WGPUCC_GFX3D);
++    uint32_t rcg = wgpu_mmio_read(cc,WGPUCC_RCG), clamp = wgpu_mmio_read(cc,WGPUCC_CLAMP);
++    uint32_t reset = wgpu_mmio_read(cc,WGPUCC_GX_RESET);
++    printf("A509: GPUCC cx=%08x gx=%08x cxo=%08x gfx3d=%08x rcg=%08x clamp=%08x gx_reset=%08x\n",cx,gx,xo,gfx,rcg,clamp,reset);
++    if (cx == 0xffffffffU || gx == 0xffffffffU || xo == 0xffffffffU || gfx == 0xffffffffU || rcg == 0xffffffffU || clamp == 0xffffffffU || reset == 0xffffffffU ||
++        !(cx & WGPU_PWR_ON) || !(gx & WGPU_PWR_ON) || (xo & WGATE_OFF) || (gfx & WGATE_OFF) || (clamp & 1U) || (reset & 1U) || (b & WGATE_OFF) || (c & WGATE_OFF)) {
++        printf("A509: STOP core not confirmed powered/clocked; no core MMIO\n");
++        goto restore;
++    }
++    printf("A509: CX_GX_ALREADY_ON; reading core status only\n");
++    vm_offset_t gpu = ml_io_map(WGPU_MMIO,WGPU_MMIO_SIZE);
++    if (gpu) {
++        /* XML offsets are dword indices, not byte offsets. */
++        uint32_t rbbm = wgpu_mmio_read(gpu,0x04f5U*4U);
++        uint32_t irq = wgpu_mmio_read(gpu,0x04e1U*4U);
++        uint32_t rp = wgpu_mmio_read(gpu,0x0806U*4U);
++        uint32_t wp = wgpu_mmio_read(gpu,0x0807U*4U);
++        printf("A509: CORE_STATUS rbbm=%08x irq=%08x rptr=%08x wptr=%08x\n",rbbm,irq,rp,wp);
++    }
++restore:
++    if (changed) {
++        uint32_t now = wgpu_read(WGCC_AHB);
++        if (now != 0xffffffffU) wgpu_mmio_write(wgcc,WGCC_AHB,now & ~WGCC_ON);
++        printf("A509: GCC cfg_ahb vote restored raw=%08x\n",wgpu_read(WGCC_AHB));
++    }
++done:
++    lck_mtx_unlock(&wgpu_lock);
++    printf("A509: BOOT_PROBE_END (no CP upload or acceleration)\n");
+ }
+ 
+ static int
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1208,12 +1208,15 @@
+ 	IOLog("TopazGPU: Adreno 610 ready, RedwoodGPU published\n");
+ }
+ 
++extern "C" void whyred_gpu_boot_probe(void);
++
+ void
+ topaz_adreno_init(void)
+ {
+ 	/* Whyred has A509, never run Topaz A610 MMIO/firmware sequences. */
+ 	uint32_t whyred_gpu = 0;
+ 	if (PE_parse_boot_argn("whyred_gpu", &whyred_gpu, sizeof(whyred_gpu)) && whyred_gpu != 0) {
++		whyred_gpu_boot_probe();
+ 		return;
+ 	}
+ 	uint32_t on = 0, mhz = 0;
