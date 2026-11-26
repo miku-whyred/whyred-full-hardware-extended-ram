@@ -18,7 +18,7 @@ import mkadt  # noqa: E402
 # Kernel RAM: every fixed carve-out sits below 0xa0400000 and the two DDR banks are adjacent,
 # so 0xa0400000-0x17e4bffff is free. mkpayload needs a 32 MB aligned base.
 mkadt.HIGH_PHYS_BASE = 0xa2000000
-mkadt.HIGH_MEM_SIZE = 0xdc000000	# up to 0x17e000000
+mkadt.HIGH_MEM_SIZE = 0x52000000  # whyred 3GB
 
 # interrupt-controller@17a00000, redistributors 0x17b00000 (stride 0x20000)
 mkadt.GICD, mkadt.GICD_SIZE = 0x17a00000, 0x10000
@@ -54,6 +54,62 @@ def set_canvas(n, w, h):
 
 def build():
     root = prune(mkadt.build(highmem=True))
+
+    # Whyred extended physical RAM.
+    # Only use explicitly approved physical ranges.
+    extra_file = os.environ.get("WHYRED_EXTRA_RAM")
+
+    if extra_file:
+        ranges = json.load(open(extra_file))
+
+        if not 1 <= len(ranges) <= 12:
+            raise ValueError("Invalid extra RAM range count")
+
+        main_base = mkadt.HIGH_PHYS_BASE
+        main_end = main_base + mkadt.HIGH_MEM_SIZE
+
+        checked = []
+
+        for base, size in ranges:
+            end = base + size
+
+            if base < 0 or size <= 0:
+                raise ValueError("Invalid RAM range")
+
+            if base % 0x4000 or size % 0x4000:
+                raise ValueError("RAM must be 16K aligned")
+
+            if base < main_end and end > main_base:
+                raise ValueError("Overlap with main RAM")
+
+            for old_base, old_end in checked:
+                if base < old_end and end > old_base:
+                    raise ValueError("Overlapping extra RAM")
+
+            checked.append((base, end))
+
+        chosen = next(
+            c for c in root.children
+            if c.name == "chosen"
+        )
+
+        chosen.props.append((
+            "hakios-extra-ram",
+            0,
+            mkadt.u64(*[
+                value
+                for pair in ranges
+                for value in pair
+            ])
+        ))
+
+        print(
+            "Extra RAM:",
+            sum(size for _, size in ranges) // 1048576,
+            "MiB",
+            file=sys.stderr
+        )
+
     # WHYRED_NATIVE=1 (with boot-arg sweetfb_native=1): iOS renders the real 1080x2160 panel instead of
     # the iPhone X canvas (1125x2436), whose centered crop hides the status bar and home indicator.
     if os.environ.get('WHYRED_NATIVE'):
