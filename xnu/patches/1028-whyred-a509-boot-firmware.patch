@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -10,6 +10,7 @@
+ #include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int topaz_fw_read(const char *, void **, size_t *);
+@@ -66,33 +67,55 @@
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_clocks, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, wgpu_clocks, "A", "Whyred A509 read-only GCC branch state; whyred_gpu=1");
+ 
++/* The boot loader's ADT owns this memory; never free its property pointers. */
++static int
++wgpu_adt_firmware(const char *name, const void **data, size_t *size)
++{
++    DTEntry node;
++    unsigned int len = 0;
++    if (SecureDTLookupEntry(NULL, "/whyred-gpu-firmware", &node) != kSuccess ||
++        SecureDTGetProperty(node, name, data, &len) != kSuccess) return ENOENT;
++    if (len == 0 || len > 1024U * 1024U) return EINVAL;
++    *size = len;
++    return 0;
++}
++
+ static int
+ wgpu_firmware SYSCTL_HANDLER_ARGS
+ {
+-    static const char *const paths[] = {
+-        FWPATH "a530_pm4.fw", FWPATH "a530_pfp.fw", FWPATH "a512_zap.mdt", FWPATH "a512_zap.b02"
++    static const char *const names[] = {
++        "a530_pm4.fw", "a530_pfp.fw", "a512_zap.mdt", "a512_zap.b00", "a512_zap.b01", "a512_zap.b02"
+     };
+-    char report[384];
+-    int err[4];
+-    size_t sz[4];
++    char report[768];
++    size_t used = 0;
+     if (!wgpu_enabled()) return ENXIO;
+     if (req->newptr != 0) return EPERM;
+-    if (!topaz_root_mounted()) return ENXIO;
+-    for (unsigned i = 0; i < 4; i++) {
+-        void *data = NULL;
+-        sz[i] = 0;
+-        err[i] = topaz_fw_read(paths[i], &data, &sz[i]);
+-        if (!err[i]) {
+-            if (i < 2 && (sz[i] < 8 || (sz[i] & 3))) err[i] = EINVAL;
+-            if (i == 2 && (sz[i] < 52 || memcmp(data, "\177ELF\1\1", 6) != 0)) err[i] = EINVAL;
+-            if (i == 3 && sz[i] == 0) err[i] = EINVAL;
+-            topaz_fw_free(data, sz[i]);
++    for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
++        const void *data = NULL;
++        void *owned = NULL;
++        size_t sz = 0;
++        const char *source = "ADT";
++        int err = wgpu_adt_firmware(names[i], &data, &sz);
++        if (err == ENOENT && topaz_root_mounted()) {
++            char path[128];
++            snprintf(path, sizeof(path), "%s%s", FWPATH, names[i]);
++            err = topaz_fw_read(path, &owned, &sz);
++            data = owned;
++            source = "rootfs";
+         }
++        if (!err) {
++            if (i < 2 && (sz < 8 || (sz & 3))) err = EINVAL;
++            if (i == 2 && (sz < 52 || memcmp(data, "\177ELF\1\1", 6) != 0)) err = EINVAL;
++            if (i >= 3 && sz == 0) err = EINVAL;
++        }
++        if (owned != NULL) topaz_fw_free(owned, sz);
++        int n = snprintf(report + used, sizeof(report) - used,
++            "%s%s: source=%s bytes=%lu errno=%d", i ? "; " : "", names[i], source,
++            (unsigned long)sz, err);
++        if (n < 0 || (size_t)n >= sizeof(report) - used) return EOVERFLOW;
++        used += (size_t)n;
+     }
+-    snprintf(report, sizeof(report),
+-        "firmware probe only: pm4=%lu bytes errno=%d; pfp=%lu bytes errno=%d; zap_mdt=%lu bytes errno=%d; zap_b02=%lu bytes errno=%d",
+-        (unsigned long)sz[0], err[0], (unsigned long)sz[1], err[1], (unsigned long)sz[2], err[2], (unsigned long)sz[3], err[3]);
+-    return SYSCTL_OUT(req, report, strlen(report) + 1);
++    return SYSCTL_OUT(req, report, used + 1);
+ }
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_firmware, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, wgpu_firmware, "A", "Whyred A509 firmware presence and basic format only; no GPU upload");
