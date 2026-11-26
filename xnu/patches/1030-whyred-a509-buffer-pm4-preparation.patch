@@ -1,0 +1,148 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -80,6 +80,15 @@
+     return 0;
+ }
+ 
++
++/* ADT-owned bytes, read-only; caller must never free the pointer. */
++int whyred_gpu_get_bootfw(const char *, const void **, size_t *);
++int
++whyred_gpu_get_bootfw(const char *name, const void **data, size_t *size)
++{
++    if (!wgpu_enabled()) return ENXIO;
++    return wgpu_adt_firmware(name, data, size);
++}
+ 
+ /* Boot-time A509 phase 3. Register offsets in Linux v6.12 gcc-sdm660.c,
+  * gpucc-sdm660.c and registers/adreno/a5xx.xml; physical bases in live FDT.
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1208,6 +1208,117 @@
+ 	IOLog("TopazGPU: Adreno 610 ready, RedwoodGPU published\n");
+ }
+ 
++/* A5xx type-7 packet format: odd parity of count and opcode.
++ * See Linux v6.12 adreno_gpu.h OUT_PKT7, adreno_pm4.xml, a5xx_me_init.
++ */
++static uint32_t
++whyred_a509_odd(uint32_t v)
++{
++    v ^= v >> 16; v ^= v >> 8; v ^= v >> 4;
++    return (0x9669U >> (v & 15U)) & 1U;
++}
++
++static uint32_t
++whyred_a509_pkt7(uint32_t opcode, uint32_t count)
++{
++    return 0x70000000U | count | (whyred_a509_odd(count) << 15) |
++        (opcode << 16) | (whyred_a509_odd(opcode) << 23);
++}
++
++static void
++whyred_a509_make_me_init(uint32_t *ring)
++{
++    ring[0] = whyred_a509_pkt7(0x48, 8);
++    ring[1] = 0x2f; ring[2] = 3; ring[3] = 0x20000000;
++    ring[4] = 0; ring[5] = 0; ring[6] = 0; ring[7] = 0; ring[8] = 0;
++}
++
++extern "C" int whyred_gpu_get_bootfw(const char *, const void **, size_t *);
++
++/* Temporary CPU-side buffers; no device can access them through a programmed
++ * GPU IOMMU yet. No fallback to the Topaz fixed physical pool. */
++struct whyred_a509_buffer {
++    IOBufferMemoryDescriptor *md;
++    uint8_t *va;
++    uint64_t pa;
++    uint64_t size;
++};
++
++static bool
++whyred_a509_alloc(struct whyred_a509_buffer *b, uint64_t size)
++{
++    if (!size || size > 256 * 1024) return false;
++    size = (size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
++    b->md = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
++        kIODirectionInOut | kIOMemoryPhysicallyContiguous | kIOMapWriteCombineCache,
++        size, 0x00000000fffff000ULL);
++    if (!b->md) return false;
++    b->va = (uint8_t *)b->md->getBytesNoCopy();
++    IOByteCount span = 0;
++    b->pa = b->md->getPhysicalSegment(0, &span, kIOMemoryMapperNone);
++    b->size = size;
++    if (!b->va || !b->pa || (b->pa & (PAGE_SIZE - 1)) || span < size ||
++        b->pa >= 0x100000000ULL || size > 0x100000000ULL - b->pa) return false;
++    /* Only admit ranges in the known main memory or the two candidate ranges.
++     * This is an allocation test, NOT authorization for GPU DMA. */
++    uint64_t end = b->pa + size;
++    if (!((b->pa >= 0xa2000000ULL && end <= 0xf4000000ULL) ||
++          (b->pa >= 0x48000000ULL && end <= 0x85600000ULL) ||
++          (b->pa >= 0x88f00000ULL && end <= 0x8ac00000ULL))) return false;
++    bzero(b->va, size);
++    return true;
++}
++
++static void
++whyred_a509_release(struct whyred_a509_buffer *b)
++{
++    if (b->md) b->md->release();
++    bzero(b, sizeof(*b));
++}
++
++static bool
++whyred_a509_stage_fw(const char *name, struct whyred_a509_buffer *b)
++{
++    const void *src = NULL;
++    size_t size = 0;
++    if (whyred_gpu_get_bootfw(name, &src, &size) || !src ||
++        size < 8 || (size & 3) || size > 256 * 1024) return false;
++    /* adreno_fw_create_bo(): first 32-bit file header is not executable ucode. */
++    if (!whyred_a509_alloc(b, size - 4)) return false;
++    memcpy(b->va, (const uint8_t *)src + 4, size - 4);
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (memcmp(b->va, (const uint8_t *)src + 4, size - 4)) return false;
++    IOLog("A509: staged %s bytes=%lu pa=%llx (CPU only)\n", name,
++        (unsigned long)(size - 4), (unsigned long long)b->pa);
++    return true;
++}
++
++static void
++whyred_a509_buffer_probe(void)
++{
++    uint32_t enabled = 0;
++    if (!PE_parse_boot_argn("whyred_gpu_memtest", &enabled, sizeof(enabled)) || enabled != 1) return;
++    struct whyred_a509_buffer pm4 = {}, pfp = {}, ring = {}, fence = {};
++    IOLog("A509: BUFFER_PREP_BEGIN (no GPU DMA)\n");
++    bool ok = whyred_a509_stage_fw("a530_pm4.fw", &pm4) &&
++        whyred_a509_stage_fw("a530_pfp.fw", &pfp) &&
++        whyred_a509_alloc(&ring, 32768) && whyred_a509_alloc(&fence, PAGE_SIZE);
++    if (ok) {
++        uint32_t *words = (uint32_t *)ring.va;
++        whyred_a509_make_me_init(words);
++        __asm__ volatile("dsb sy" ::: "memory");
++        ok = words[0] == 0x70c80008U && words[1] == 0x2f &&
++            words[2] == 3 && words[3] == 0x20000000 && words[8] == 0;
++        IOLog("A509: ring pa=%llx size=%llu fence pa=%llx ME_INIT=%08x\n",
++            (unsigned long long)ring.pa, (unsigned long long)ring.size,
++            (unsigned long long)fence.pa, words[0]);
++    }
++    whyred_a509_release(&fence); whyred_a509_release(&ring);
++    whyred_a509_release(&pfp); whyred_a509_release(&pm4);
++    IOLog("A509: %s (buffers released; no GPU execution)\n",
++        ok ? "BUFFER_PREP_PASS" : "BUFFER_PREP_FAIL");
++}
++
+ extern "C" void whyred_gpu_boot_probe(void);
+ 
+ void
+@@ -1217,6 +1328,7 @@
+ 	uint32_t whyred_gpu = 0;
+ 	if (PE_parse_boot_argn("whyred_gpu", &whyred_gpu, sizeof(whyred_gpu)) && whyred_gpu != 0) {
+ 		whyred_gpu_boot_probe();
++		whyred_a509_buffer_probe();
+ 		return;
+ 	}
+ 	uint32_t on = 0, mhz = 0;
