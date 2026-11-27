@@ -1,0 +1,246 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1319,6 +1319,233 @@
+         ok ? "BUFFER_PREP_PASS" : "BUFFER_PREP_FAIL");
+ }
+ 
++/* A509 phase 6: private GPU IOVA window; no identity map of system RAM.
++ * Linux v6.12 arm-smmu.h, a5xx_gpu.c, a5xx.xml; whyred live DT SID 0 user,
++ * SID 2 secure, GPU 0x05000000 size 0x40000, SMMU 0x05040000 size 0x10000.
++ * Never change secure context banks or global SMMU control. Fail closed.
++ * Keep all DMA memory pinned for the session once hardware can reference it.
++ */
++struct wa509_cp_storage {
++    whyred_a509_buffer pm4, pfp, ring, fence, l1, l2, l3;
++};
++static struct wa509_cp_storage wa509_cp;
++static uint32_t wa509_cp_state;
++static const uint64_t wa509_iova[4] = {0x40000000ULL,0x40040000ULL,0x40080000ULL,0x400c0000ULL};
++static uint32_t
++wa509_cp_rd(vm_offset_t v, uint32_t o)
++{
++    return *(volatile uint32_t *)(v+o);
++}
++static void
++wa509_cp_wr(vm_offset_t v, uint32_t o, uint32_t x)
++{
++    *(volatile uint32_t *)(v+o)=x;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++static bool
++wa509_cp_set(vm_offset_t v, uint32_t o, uint32_t x)
++{
++    wa509_cp_wr(v,o,x);
++    return wa509_cp_rd(v,o)==x;
++}
++static void
++wa509_cp_gw(vm_offset_t v, uint32_t reg, uint32_t x)
++{
++    wa509_cp_wr(v,reg*4U,x);
++}
++static void
++wa509_cp_gw64(vm_offset_t v, uint32_t reg, uint64_t x)
++{
++    wa509_cp_gw(v,reg,(uint32_t)x);
++    wa509_cp_gw(v,reg+1,(uint32_t)(x>>32));
++}
++static uint32_t
++wa509_cp_gr(vm_offset_t v, uint32_t reg)
++{
++    return wa509_cp_rd(v,reg*4U);
++}
++static void
++wa509_cp_mark(uint32_t state)
++{
++    __atomic_store_n(&wa509_cp_state,state,__ATOMIC_RELEASE);
++    IOLog("A509: CP_STAGE=%u\n",state);
++}
++/* 32-bit VA, 4 KiB granule, L1->L2->L3. All four buffers share one 2 MiB
++ * region. Only their allocated pages are mapped, with XN and firmware RO.
++ * MAIR0 attr0 normal noncacheable; outer shareable. */
++static bool
++wa509_cp_tables(void)
++{
++    auto &s=wa509_cp;
++    if (!whyred_a509_alloc(&s.l1,PAGE_SIZE) || !whyred_a509_alloc(&s.l2,PAGE_SIZE) ||
++        !whyred_a509_alloc(&s.l3,PAGE_SIZE)) return false;
++    uint64_t *a=(uint64_t *)s.l1.va, *b=(uint64_t *)s.l2.va, *c=(uint64_t *)s.l3.va;
++    a[1]=s.l2.pa|3ULL;
++    b[0]=s.l3.pa|3ULL;
++    whyred_a509_buffer *bufs[]={&s.pm4,&s.pfp,&s.ring,&s.fence};
++    for (unsigned i=0;i<4;i++) {
++        auto *buf=bufs[i];
++        if (!buf->size || buf->size>0x40000 || (buf->size&4095) || (buf->pa&4095)) return false;
++        unsigned slot=(unsigned)((wa509_iova[i]>>12)&511);
++        for (uint64_t off=0;off<buf->size;off+=4096) {
++            unsigned n=slot+(unsigned)(off>>12);
++            if (n>=512 || c[n]) return false;
++            c[n]=(buf->pa+off)|3ULL|(1ULL<<6)|(2ULL<<8)|(1ULL<<10)|
++                 (3ULL<<53)|(i<2 ? (1ULL<<7):0);
++        }
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    return true;
++}
++/* Do not borrow a context from another stream. Only a previously faulting
++ * exact SID0 entry, or an unused entry when unmatched streams fault, is
++ * eligible. Never match SID2, never modify sCR0, never issue global TLB sync.
++ * qcom skip-init can reject programming: every control write is read back.
++ */
++static bool
++wa509_cp_smmu(vm_offset_t smmu, vm_offset_t *cb_out)
++{
++    uint32_t cr=wa509_cp_rd(smmu,0), id0=wa509_cp_rd(smmu,0x20),
++        id1=wa509_cp_rd(smmu,0x24), id2=wa509_cp_rd(smmu,0x28);
++    unsigned banks=id1&255, s2banks=(id1>>16)&255, slots=id0&255;
++    unsigned pg=(id1>>31)?65536:4096;
++    unsigned grspan=pg*(1U<<(((id1>>28)&7)+1));
++    IOLog("A509: SMMU ID=%08x/%08x/%08x CR0=%08x banks=%u slots=%u span=%x\n",id0,id1,id2,cr,banks,slots,grspan);
++    if (cr==0xffffffffU || id0==0xffffffffU || id1==0xffffffffU || id2==0xffffffffU ||
++        (cr&9U) || !(id0&(1U<<30)) || !(id0&(1U<<27)) || !(id2&(1U<<12)) ||
++        (id2&15)>6 || ((id2>>4)&15)>6 || pg!=4096 || banks!=5 || s2banks>=banks ||
++        !slots || slots>128 || grspan!=0x8000 || grspan+banks*pg>0x10000) return false;
++    int slot=-1, spare=-1;
++    uint32_t occupied=0;
++    for (unsigned i=0;i<slots;i++) {
++        uint32_t smr=wa509_cp_rd(smmu,0x800+4*i), s2=wa509_cp_rd(smmu,0xc00+4*i);
++        if (smr==0xffffffffU || s2==0xffffffffU) return false;
++        if (!(smr>>31)) { if (spare<0) spare=(int)i; continue; }
++        unsigned type=(s2>>16)&3, bank=s2&255;
++        if (type==0) { if (bank>=banks) return false; occupied|=1U<<bank; }
++        unsigned mask=(smr>>16)&0x7fff, sid=smr&0x7fff;
++        if ((sid&~mask)==0) {
++            if (mask || sid || type!=2 || slot>=0) return false;
++            slot=(int)i;
++        }
++    }
++    if (slot<0) { if (!(cr&(1U<<10))) return false; slot=spare; }
++    if (slot<0) return false;
++    int bank=-1;
++    for (unsigned i=s2banks;i<1;i++) {
++        vm_offset_t cb=smmu+grspan+i*pg;
++        uint32_t ctl=wa509_cp_rd(cb,0), cbar=wa509_cp_rd(smmu+pg,4*i);
++        /* Live DT gfx3d_user GPU offset 0x48000 identifies CB0.
++         * Only unused, disabled banks with a non-secure stage-1 type, or
++         * reset CBAR (zero). No bank claimed by a valid stream is reused. */
++        if (!(occupied&(1U<<i)) && ctl==0 && (cbar==0 || cbar==0x10000)) {bank=(int)i; break;}
++    }
++    if (bank<0) return false;
++    vm_offset_t gr1=smmu+pg, cb=smmu+grspan+bank*pg;
++    unsigned asid=(unsigned)bank+1;
++    uint64_t ttbr=wa509_cp.l1.pa|((uint64_t)asid<<48);
++    uint32_t old_smr=wa509_cp_rd(smmu,0x800+4*slot);
++    uint32_t old_s2=wa509_cp_rd(smmu,0xc00+4*slot);
++    IOLog("A509: SMMU SID0 slot=%d CB=%d ttbr=%llx\n",slot,bank,(unsigned long long)ttbr);
++    /* Install the bank before enabling its stream; if a write fails, the
++     * pinned tables remain alive and no GPU submission is allowed. */
++    if (!wa509_cp_set(gr1,4*bank,0x1f300) || !wa509_cp_set(gr1,0x800+4*bank,1) ||
++        !wa509_cp_set(cb,0x10,(7U<<15)) || !wa509_cp_set(cb,0x30,32U|(1U<<23)) ||
++        !wa509_cp_set(cb,0x38,0x44) || !wa509_cp_set(cb,0x20,(uint32_t)ttbr) ||
++        !wa509_cp_set(cb,0x24,(uint32_t)(ttbr>>32))) return false;
++    wa509_cp_wr(cb,0x58,0xffffffffU);  /* W1C context fault */
++    wa509_cp_wr(cb,0x610,asid);        /* only our ASID */
++    wa509_cp_wr(cb,0x7f0,0);
++    bool sync=false;
++    for (unsigned i=0;i<400;i++) {
++        uint32_t x=wa509_cp_rd(cb,0x7f4);
++        if (x!=0xffffffffU && !(x&1)) {sync=true; break;}
++        IODelay(10);
++    }
++    if (!sync || !wa509_cp_set(cb,0,0x27)) return false;
++    /* For an exact fault entry, first leave it faulting while SMR stays
++     * unchanged. For a new entry, program S2CR before marking SMR valid. */
++    if (!wa509_cp_set(smmu,0xc00+4*slot,(uint32_t)bank) ||
++        !wa509_cp_set(smmu,0x800+4*slot,0x80000000U)) {
++        wa509_cp_wr(smmu,0xc00+4*slot,old_s2);
++        wa509_cp_wr(smmu,0x800+4*slot,old_smr);
++        return false;
++    }
++    *cb_out=cb;
++    return true;
++}
++static bool
++wa509_cp_wait(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
++{
++    for (unsigned i=0;i<2000;i++) {
++        uint32_t fsr=wa509_cp_rd(cb,0x58), fault=wa509_cp_gr(gpu,0xb1a), rp=wa509_cp_gr(gpu,0x806);
++        if (fsr || fault || rp==0xffffffffU) {
++            IOLog("A509: CP fault FSR=%08x HW=%08x RP=%08x\n",fsr,fault,rp);
++            return false;
++        }
++        uint32_t status=wa509_cp_gr(gpu,0x4f5);
++        if (rp==wp && status!=0xffffffffU && !(status&(1U<<31))) return true;
++        IODelay(100);
++    }
++    return false;
++}
++static void
++whyred_a509_run_cp(void)
++{
++    uint32_t enabled=0;
++    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled!=1) return;
++    if (__atomic_exchange_n(&wa509_cp_state,1,__ATOMIC_ACQ_REL)!=0) return;
++    auto &s=wa509_cp;
++    if (!whyred_a509_stage_fw("a530_pm4.fw",&s.pm4) || !whyred_a509_stage_fw("a530_pfp.fw",&s.pfp) ||
++        !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) || !wa509_cp_tables()) {
++        wa509_cp_mark(101); return;
++    }
++    wa509_cp_mark(2);
++    vm_offset_t gpu=ml_io_map(0x05000000,0x40000), smmu=ml_io_map(0x05040000,0x10000), cb=0;
++    if (!gpu || !smmu) {wa509_cp_mark(102); return;}
++    /* No write to trust control, no CP_SET_SECURE_MODE without real PAS
++     * authentication. Normal execution may be possible only after ZAP. */
++    uint32_t trust=wa509_cp_gr(gpu,0xf400);
++    IOLog("A509: CP trust=%08x (no secure bypass)\n",trust);
++    if (trust!=0) {wa509_cp_mark(103); return;}
++    if (!wa509_cp_smmu(smmu,&cb)) {wa509_cp_mark(104); return;}
++    wa509_cp_mark(3);
++    if (wa509_cp_gr(gpu,0x806)!=0 || wa509_cp_gr(gpu,0x807)!=0 ||
++        wa509_cp_gr(gpu,0x4f5)==0xffffffffU || (wa509_cp_gr(gpu,0x4f5)&(1U<<31))) {
++        wa509_cp_mark(105); return;
++    }
++    uint32_t *rb=(uint32_t *)s.ring.va;
++    whyred_a509_make_me_init(rb);
++    rb[9]=whyred_a509_pkt7(0x3d,3);  /* CP_MEM_WRITE */
++    rb[10]=(uint32_t)wa509_iova[3]; rb[11]=(uint32_t)(wa509_iova[3]>>32); rb[12]=0xc0ffee01;
++    __asm__ volatile("dsb sy" ::: "memory");
++    /* Mainline A509-specific thresholds, not A530 MERCIU value. Keep
++     * interrupts masked during this one-shot polling test. */
++    wa509_cp_gw(gpu,0x0038,0);
++    wa509_cp_gw(gpu,0x3049,3); wa509_cp_gw(gpu,0x302a,9);
++    wa509_cp_gw(gpu,0x0093,1); wa509_cp_gw(gpu,0x0094,0xa6ffffff); wa509_cp_gw(gpu,0x0095,0x3f);
++    wa509_cp_gw(gpu,0x0825,0x40); wa509_cp_gw(gpu,0x0826,0x400);
++    wa509_cp_gw(gpu,0x081f,0x40201b16); wa509_cp_gw(gpu,0x0820,0x80000060);
++    wa509_cp_gw(gpu,0x0833,0x02000000); wa509_cp_gw(gpu,0x0860,1);
++    wa509_cp_gw64(gpu,0x0838,wa509_iova[0]); wa509_cp_gw64(gpu,0x0835,wa509_iova[1]);
++    wa509_cp_gw64(gpu,0x0800,wa509_iova[2]);
++    wa509_cp_gw(gpu,0x0802,12U|(2U<<8)|(1U<<27));
++    if (wa509_cp_gr(gpu,0x0800)!=(uint32_t)wa509_iova[2] || wa509_cp_gr(gpu,0x0838)!=(uint32_t)wa509_iova[0] ||
++        wa509_cp_gr(gpu,0x0835)!=(uint32_t)wa509_iova[1]) {wa509_cp_mark(106);return;}
++    wa509_cp_mark(4);
++    wa509_cp_gw(gpu,0x0832,0); wa509_cp_gw(gpu,0x0807,9);
++    if (!wa509_cp_wait(gpu,cb,9)) {wa509_cp_mark(107);return;}
++    wa509_cp_mark(5);
++    wa509_cp_gw(gpu,0x0807,13);
++    if (!wa509_cp_wait(gpu,cb,13)) {wa509_cp_mark(108);return;}
++    __asm__ volatile("dsb sy" ::: "memory");
++    uint32_t fence=*(volatile uint32_t *)s.fence.va;
++    IOLog("A509: hardware fence=%08x\n",fence);
++    wa509_cp_mark(fence==0xc0ffee01 ? 6 : 109);
++    /* All buffers and mappings retained, even on failure. No arbitrary
++     * submissions exposed. Reset device before another test. */
++}
++
+ extern "C" bool whyred_gpu_power_on(void);
+ extern "C" bool whyred_gpu_rails_ready(void);
+ 
+@@ -1329,7 +1556,7 @@
+ {
+     IOSleep(45000);
+     for (unsigned i = 0; i < 120 && !whyred_gpu_rails_ready(); ++i) IOSleep(1000);
+-    (void)whyred_gpu_power_on();
++    if (whyred_gpu_power_on()) whyred_a509_run_cp();
+ }
+ 
+ static void
