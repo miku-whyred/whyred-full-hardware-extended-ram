@@ -1,0 +1,27 @@
+name: a509-direct-userspace
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/whyred-a509-direct/**'
+      - '.github/workflows/a509-direct.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash tools/whyred-a509-direct/build.sh
+      - name: Verify binary
+        run: |
+          cd tools/whyred-a509-direct/out
+          lipo -archs a509_direct_test | grep -x arm64
+          codesign --verify --verbose a509_direct_test
+          shasum -a 256 a509_direct_test > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a509-direct-ios-test
+          path: tools/whyred-a509-direct/out/
+          if-no-files-found: error

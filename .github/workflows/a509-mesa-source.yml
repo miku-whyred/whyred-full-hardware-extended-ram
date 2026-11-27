@@ -1,0 +1,18 @@
+name: a509-mesa-source
+on:
+  workflow_dispatch:
+jobs:
+  compile-source:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: brew install bison flex pkgconf
+      - name: Build from original Mesa source
+        run: bash tools/whyred-a509-mesa/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a509-mesa-source-experimental
+          path: tools/whyred-a509-mesa/out/
+          if-no-files-found: error

@@ -1,0 +1,502 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1977,15 +1977,20 @@
+ 
+ /* Hardware ARRAY_PITCH is 16 bits in units of 64 bytes. Split a frame
+  * into stripes within that bound; one ring submission and one final fence. */
++extern "C" bool whyred_a509_clock_dynamic(void);
++extern "C" bool whyred_a509_clock_select(bool);
++static uint64_t wa509_last_activity;
+ static bool wa509_linear_copy(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp,
+-    uint32_t w,uint32_t h,uint32_t sp,uint32_t dp,uint32_t sx,uint64_t src,uint64_t dst,uint32_t seq,uint32_t budget)
++    uint32_t w,uint32_t h,uint32_t sp,uint32_t dp,uint32_t sx,uint32_t dx,uint64_t src,uint64_t dst,uint32_t seq,uint32_t budget)
+ {
+     if (!wa509_direct_geometry(w,h,dp) || !sp || sp>8192 || (sp&63) || sx>2048 ||
+-        (uint64_t)(sx+w)*4>sp || (uint64_t)sp*h>wa509_direct_bytes || (src&63) || (dst&63) || !seq || wp>=8192 ||
++        (uint64_t)(sx+w)*4>sp || dx>2048 || (uint64_t)(dx+w)*4>dp || (uint64_t)sp*h>wa509_direct_bytes || (src&63) || (dst&63) || !seq || wp>=8192 ||
+         wa509_cp.ring.size!=32768 || wa509_cp_gr(gpu,0x806)!=wp || wa509_cp_gr(gpu,0x807)!=wp) return false;
+     uint32_t *rb=(uint32_t *)wa509_cp.ring.va;
+     volatile uint32_t *f=(volatile uint32_t *)wa509_cp.fence.va;
+     uint32_t p=wp, words=0;
++    if(!whyred_a509_clock_select(true))return false;
++    __atomic_store_n(&wa509_last_activity,mach_absolute_time(),__ATOMIC_RELAXED);
+     f[1]=0;
+     auto emit=[&](uint32_t x){rb[p]=x;p=(p+1U)&8191U;words++;};
+     auto reg=[&](uint32_t r,uint32_t x){emit(wa509_pkt4(r,1));emit(x);};
+@@ -2008,8 +2013,8 @@
+             for (unsigned j=0;j<5;j++) emit(0);
+             reg(i?0x2182:0x2181,0x30);
+         }
+-        uint32_t rect=(w-1)|((rows-1)<<16);
+-        packet(0x2c,5);emit(1);emit(sx);emit((sx+w-1)|((rows-1)<<16));emit(0);emit(rect);
++        uint32_t rect=(dx+w-1)|((rows-1)<<16);
++        packet(0x2c,5);emit(1);emit(sx);emit((sx+w-1)|((rows-1)<<16));emit(dx);emit(rect);
+         packet(0x6c,1);emit(8);packet(0x26,0);
+         y+=rows;
+     }
+@@ -2027,7 +2032,9 @@
+             rp=wa509_cp_gr(gpu,0x806),status=wa509_cp_gr(gpu,0x4f5);
+         if (fsr || fault || rp==0xffffffffU || status==0xffffffffU) return false;
+         __asm__ volatile("dsb sy" ::: "memory");
+-        if (rp==p && !(status&(1U<<31)) && f[1]==seq) {wp=p;return true;}
++        if (rp==p && !(status&(1U<<31)) && f[1]==seq) {
++            wp=p;__atomic_store_n(&wa509_last_activity,mach_absolute_time(),__ATOMIC_RELAXED);return true;
++        }
+         if (mach_absolute_time()>=deadline) return false;
+         if (n<40) IODelay(10);
+         else if (__atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE)) wa509_irq_wait(observed);
+@@ -2037,7 +2044,7 @@
+ static bool wa509_direct_copy(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp,
+     uint32_t w,uint32_t h,uint32_t pitch,uint32_t seq,unsigned slot)
+ {
+-    return slot<wa509_contexts && wa509_linear_copy(gpu,cb,wp,w,h,pitch,pitch,0,
++    return slot<wa509_contexts && wa509_linear_copy(gpu,cb,wp,w,h,pitch,pitch,0,0,
+         wa509_direct_va[2*slot],wa509_direct_va[2*slot+1],seq,1000);
+ }
+ /* Whyred native display bridge. Private output scanout buffers, not a foreign
+@@ -2062,7 +2069,7 @@
+ static bool wa509_display_tables(void)
+ {
+     uint32_t enabled=0;
+-    if (!PE_parse_boot_argn("a509fb",&enabled,sizeof(enabled)) || enabled!=1) return false;
++    if (!PE_parse_boot_argn("a509fb",&enabled,sizeof(enabled)) || enabled<1 || enabled>3) return false;
+     uint64_t *l2=(uint64_t *)wa509_cp.l2.va;
+     if (!l2 || PAGE_SIZE!=16384) return false;
+     for (unsigned b=0;b<2;b++) {
+@@ -2135,9 +2142,19 @@
+     for (unsigned b=0;b<2;b++) {
+         auto *dst=(volatile uint32_t *)wa509_display_bo[b]->getBytesNoCopy();
+         for (unsigned i=0;i<2048;i++) dst[i]=0xdeadbeef;
+-        if (!wa509_linear_copy(gpu,cb,wp,32,32,256,128,16,va,wa509_display_dst[b],++wa509_direct_seq,1000)) return false;
++        if (!wa509_linear_copy(gpu,cb,wp,32,32,256,128,16,0,va,wa509_display_dst[b],++wa509_direct_seq,1000)) return false;
+         for (unsigned i=0;i<1024;i++) if (dst[i]!=wa509_pixel((i/32)*64+16+i%32)) return false;
+         for (unsigned i=1024;i<2048;i++) if (dst[i]!=0xdeadbeef) return false;
++    }
++    for (unsigned b=0;b<2;b++) {
++        auto *dst=(volatile uint32_t *)wa509_display_bo[b]->getBytesNoCopy();
++        for(unsigned i=0;i<2048;i++)dst[i]=0xdeadbeefU;
++        if(!wa509_linear_copy(gpu,cb,wp,16,16,256,256,8,16,va,wa509_display_dst[b],++wa509_direct_seq,1000))return false;
++        for(unsigned i=0;i<2048;i++) {
++            unsigned x=i%64,y=i/64;
++            uint32_t want=y<16 && x>=16 && x<32?wa509_pixel(y*64+x-8):0xdeadbeefU;
++            if(dst[i]!=want)return false;
++        }
+     }
+     wa509_display_clear();
+     if (!wa509_display_tlb()) return false;
+@@ -2155,6 +2172,32 @@
+  * scanout buffer; on timeout it cannot touch the original CPU framebuffer.
+  * The display caller serializes selecting the target and latching MDP.
+  */
++/* Optional visual proof when USB/SSH is unavailable (a509fb=3 only).
++ * GPU writes a 64x16 black/white/green pattern in the bottom left corner
++ * of its offscreen scanout buffer. Verify actual output pixels before
++ * presenting. CPU fallback never paints the marker. Not a 3D test. */
++static uint32_t wa509_marker_mode;
++static bool wa509_display_marker(unsigned target,uint32_t w,uint32_t h,uint32_t dp)
++{
++    if(!wa509_marker_mode){
++        uint32_t mode=0;(void)PE_parse_boot_argn("a509fb",&mode,sizeof(mode));wa509_marker_mode=mode==3?2U:1U;
++    }
++    if(wa509_marker_mode!=2)return true;
++    if(target>=2 || w<96 || h<48 || !wa509_cp.src.va || wa509_cp.src.size<4096)return false;
++    uint32_t *src=(uint32_t *)wa509_cp.src.va;
++    for(unsigned y=0;y<16;y++)for(unsigned x=0;x<64;x++)
++        src[y*64+x]=x<2 || x>=62 || y<2 || y>=14?0xffffffffU:((x/8)&1)?0xff00ff00U:0xff000000U;
++    __asm__ volatile("dsb sy" ::: "memory");
++    IOLockLock(wa509_direct_lock);uint32_t seq=++wa509_direct_seq;if(!seq)seq=++wa509_direct_seq;IOLockUnlock(wa509_direct_lock);
++    uint32_t dy=h-32;
++    if(!wa509_linear_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,64,16,256,dp,0,16,
++        wa509_iova[4],wa509_display_dst[target]+(uint64_t)dy*dp,seq,4))return false;
++    auto *dst=(volatile uint32_t *)wa509_display_bo[target]->getBytesNoCopy();
++    for(unsigned y=0;y<16;y++)for(unsigned x=0;x<64;x++)
++        if(dst[(dy+y)*(dp/4)+16+x]!=src[y*64+x])return false;
++    return true;
++}
++
+ extern "C" bool whyred_a509_display_copy(IOMemoryDescriptor *,uintptr_t,uint64_t,
+     uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint64_t *);
+ bool whyred_a509_display_copy(IOMemoryDescriptor *md,uintptr_t va,uint64_t off,
+@@ -2182,10 +2225,11 @@
+     sweet_dcache_clean((vm_offset_t)(va+off),(unsigned)bytes);
+     if (!wa509_display_tlb()) {unsafe=true;goto done;}
+     // Tight budget; CPU fallback is available if the GPU is too slow.
+-    if (!wa509_linear_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,w,h,sp,dp,sx,
++    if (!wa509_linear_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,w,h,sp,dp,sx,0,
+         iova,wa509_display_dst[target],seq,12)) {unsafe=true;goto done;}
+     wa509_display_clear();mapped=false;
+     if (!wa509_display_tlb()) {unsafe=true;goto done;}
++    if(!wa509_display_marker(target,w,h,dp)){unsafe=true;goto done;}
+     *out=wa509_display_pa[target];ok=true;
+  done:
+     if (unsafe) {
+@@ -2205,6 +2249,111 @@
+         if (ok) __atomic_add_fetch(&wa509_display_count,1,__ATOMIC_RELAXED);
+         else __atomic_add_fetch(&wa509_display_skip,1,__ATOMIC_RELAXED);
+     }
++    IOLockUnlock(wa509_hw_lock);return ok;
++}
++
++/* 1037: bounded native opaque layer composition. Mirrors the existing
++ * SweetFramebuffer CPU overwrite semantics, not alpha blending. All source
++ * descriptors originate from the framebuffer's existing IOSurface lookup.
++ * One hardware lock for a complete frame; never scan an incomplete output. */
++struct wa509_layer {
++    IOMemoryDescriptor *md;
++    uintptr_t va;
++    uint64_t off;
++    uint32_t w,h,sp,sx,dx,dy;
++};
++static uint32_t wa509_composed,wa509_layers,wa509_compose_skip;
++static uint64_t wa509_last_frame_ns,wa509_max_frame_ns;
++static void wa509_frame_timing(uint64_t start)
++{
++    uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
++    __atomic_store_n(&wa509_last_frame_ns,ns,__ATOMIC_RELAXED);
++    uint64_t old=__atomic_load_n(&wa509_max_frame_ns,__ATOMIC_RELAXED);
++    while(ns>old && !__atomic_compare_exchange_n(&wa509_max_frame_ns,&old,ns,false,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
++}
++static bool wa509_layer_valid(const wa509_layer &l,uint32_t w,uint32_t h,uint32_t dp)
++{
++    if (!l.md || !l.va || !OSDynamicCast(IOBufferMemoryDescriptor,l.md) || !l.w || !l.h ||
++        l.dx>=w || l.dy>=h || l.w>w-l.dx || l.h>h-l.dy || !l.sp || l.sp>8192 ||
++        (l.sp&63) || (l.off&63) || l.sx>2048 || (uint64_t)(l.sx+l.w)*4>l.sp ||
++        (uint64_t)(l.dx+l.w)*4>dp || l.off>l.md->getLength()) return false;
++    uint64_t bytes=(uint64_t)l.sp*l.h;
++    return bytes<=wa509_direct_bytes && bytes<=l.md->getLength()-l.off;
++}
++extern "C" const uint8_t *whyred_a509_scanout_view(uint64_t pa);
++const uint8_t *whyred_a509_scanout_view(uint64_t pa)
++{
++    for(unsigned b=0;b<2;b++) if(pa && pa==wa509_display_pa[b] && wa509_display_bo[b])
++        return (const uint8_t *)wa509_display_bo[b]->getBytesNoCopy();
++    return nullptr;
++}
++extern "C" uint64_t whyred_a509_compose_status(unsigned which);
++uint64_t whyred_a509_compose_status(unsigned which)
++{
++    switch(which){
++        case 0:return __atomic_load_n(&wa509_composed,__ATOMIC_RELAXED);
++        case 1:return __atomic_load_n(&wa509_layers,__ATOMIC_RELAXED);
++        case 2:return __atomic_load_n(&wa509_compose_skip,__ATOMIC_RELAXED);
++        case 3:return __atomic_load_n(&wa509_last_frame_ns,__ATOMIC_RELAXED);
++        default:return __atomic_load_n(&wa509_max_frame_ns,__ATOMIC_RELAXED);
++    }
++}
++extern "C" bool whyred_a509_compose(const wa509_layer *,unsigned,uint32_t,uint32_t,uint32_t,uint64_t,uint64_t *);
++bool whyred_a509_compose(const wa509_layer *layers,unsigned n,uint32_t w,uint32_t h,uint32_t dp,uint64_t current,uint64_t *out)
++{
++    // Require a full first layer. Partial frames would need preserved front
++    // contents, which may belong to the CPU fallback and are not mapped here.
++    if (!layers || !out || n<2 || n>4 || !wa509_direct_geometry(w,h,dp) ||
++        layers[0].dx || layers[0].dy || layers[0].w!=w || layers[0].h!=h ||
++        !__atomic_load_n(&wa509_display_ready,__ATOMIC_ACQUIRE) || !wa509_hw_lock || !wa509_direct_lock) return false;
++    for(unsigned i=0;i<n;i++) if(!wa509_layer_valid(layers[i],w,h,dp)) return false;
++    if(!IOLockTryLock(wa509_hw_lock)){__atomic_add_fetch(&wa509_compose_skip,1,__ATOMIC_RELAXED);return false;}
++    uint64_t start=mach_absolute_time(),deadline;
++    clock_interval_to_deadline(12,NSEC_PER_MSEC,&deadline);
++    bool ok=false,unsafe=false,mapped=false;
++    IOMemoryDescriptor *pinned=nullptr;
++    unsigned target=current==wa509_display_pa[0]?1:0;
++    IOLockLock(wa509_direct_lock);bool dead=wa509_direct_dead;IOLockUnlock(wa509_direct_lock);
++    if(dead || whyred_a509_cp_status()!=12) goto done;
++    for(unsigned i=0;i<n;i++) {
++        const auto &l=layers[i];uint64_t iova=0,bytes=(uint64_t)l.sp*l.h;
++        if(mach_absolute_time()>=deadline) goto done; // no new commands after budget
++        l.md->retain();
++        if(l.md->prepare(kIODirectionOut)!=kIOReturnSuccess){l.md->release();goto done;}
++        pinned=l.md;
++        if(!wa509_display_map(l.md,l.off,bytes,&iova)) goto done;
++        mapped=true;
++        sweet_dcache_clean((vm_offset_t)(l.va+l.off),(unsigned)bytes);
++        if(!wa509_display_tlb()){unsafe=true;goto done;}
++        uint64_t now=mach_absolute_time(),left=0;
++        if(now>=deadline) goto done;
++        absolutetime_to_nanoseconds(deadline-now,&left);
++        uint32_t budget=(uint32_t)(left/NSEC_PER_MSEC);
++        if(!budget) goto done;
++        IOLockLock(wa509_direct_lock);uint32_t seq=++wa509_direct_seq;if(!seq)seq=++wa509_direct_seq;IOLockUnlock(wa509_direct_lock);
++        if(!wa509_linear_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,l.w,l.h,l.sp,dp,l.sx,l.dx,
++            iova,wa509_display_dst[target]+(uint64_t)l.dy*dp,seq,budget)){unsafe=true;goto done;}
++        wa509_display_clear();mapped=false;
++        if(!wa509_display_tlb()){unsafe=true;goto done;}
++        pinned->complete(kIODirectionOut);pinned->release();pinned=nullptr;
++    }
++    if(!wa509_display_marker(target,w,h,dp)){unsafe=true;goto done;}
++    *out=wa509_display_pa[target];ok=true;
++ done:
++    if(mapped && !unsafe){wa509_display_clear();if(!wa509_display_tlb())unsafe=true;}
++    if(unsafe){
++        // The currently referenced source must stay wired. No publication
++        // of a partial frame and no further DMA until device reset.
++        wa509_display_quarantined=pinned;pinned=nullptr;
++        __atomic_store_n(&wa509_display_ready,false,__ATOMIC_RELEASE);
++        IOLockLock(wa509_direct_lock);wa509_direct_dead=true;wa509_cp_mark(117);
++        for(unsigned i=0;i<wa509_contexts;i++){if(wa509_jobs[i].state==1)wa509_jobs[i].state=4;IOLockWakeup(wa509_direct_lock,&wa509_jobs[i],false);}
++        IOLockUnlock(wa509_direct_lock);
++        __atomic_add_fetch(&wa509_display_fault,1,__ATOMIC_RELAXED);
++    }
++    if(pinned){pinned->complete(kIODirectionOut);pinned->release();}
++    if(ok){__atomic_add_fetch(&wa509_composed,1,__ATOMIC_RELAXED);__atomic_add_fetch(&wa509_layers,n,__ATOMIC_RELAXED);wa509_frame_timing(start);}
++    else __atomic_add_fetch(&wa509_compose_skip,1,__ATOMIC_RELAXED);
+     IOLockUnlock(wa509_hw_lock);return ok;
+ }
+ 
+@@ -2247,7 +2396,27 @@
+     IOLockLock(wa509_direct_lock);
+     for (;;) {
+         int slot;
+-        while ((slot=wa509_next_job())<0) IOLockSleep(wa509_direct_lock,&wa509_work_event,THREAD_UNINT);
++        while ((slot=wa509_next_job())<0) {
++            if(wa509_direct_dead || !whyred_a509_clock_dynamic()) {
++                IOLockSleep(wa509_direct_lock,&wa509_work_event,THREAD_UNINT);continue;
++            }
++            uint64_t deadline;clock_interval_to_deadline(250,NSEC_PER_MSEC,&deadline);
++            if(IOLockSleepDeadline(wa509_direct_lock,&wa509_work_event,deadline,THREAD_UNINT)!=THREAD_TIMED_OUT)continue;
++            IOLockUnlock(wa509_direct_lock);
++            if(IOLockTryLock(wa509_hw_lock)) {
++                IOLockLock(wa509_direct_lock);
++                bool idle=!wa509_direct_dead && wa509_jobs[0].state!=1 && wa509_jobs[1].state!=1;
++                IOLockUnlock(wa509_direct_lock);
++                uint64_t ns=0;absolutetime_to_nanoseconds(mach_absolute_time()-__atomic_load_n(&wa509_last_activity,__ATOMIC_RELAXED),&ns);
++                if(idle && ns>=250000000ULL && !whyred_a509_clock_select(false)) {
++                    IOLockLock(wa509_direct_lock);wa509_direct_dead=true;wa509_cp_mark(120);
++                    for(unsigned i=0;i<wa509_contexts;i++){if(wa509_jobs[i].state==1)wa509_jobs[i].state=4;IOLockWakeup(wa509_direct_lock,&wa509_jobs[i],false);}
++                    IOLockUnlock(wa509_direct_lock);
++                }
++                IOLockUnlock(wa509_hw_lock);
++            }
++            IOLockLock(wa509_direct_lock);
++        }
+         auto &j=wa509_jobs[slot];
+         auto work=j;j.state=2;
+         IOLockUnlock(wa509_direct_lock);
+@@ -2256,7 +2425,6 @@
+         IOLockLock(wa509_direct_lock);bool allowed=!wa509_direct_dead;IOLockUnlock(wa509_direct_lock);
+         bool ok=allowed && wa509_direct_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,
+             work.w,work.h,work.pitch,work.seq,(unsigned)slot);
+-        IOLockUnlock(wa509_hw_lock);
+         absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
+         IOLockLock(wa509_direct_lock);
+         j.ns=ns;j.state=ok?3:4;
+@@ -2269,6 +2437,7 @@
+             }
+         }
+         IOLockWakeup(wa509_direct_lock,&j,false);
++        IOLockUnlock(wa509_hw_lock);
+     }
+ }
+ class WhyredA509DirectService : public IOService {
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -36,6 +36,9 @@
+  */
+ #include "SweetSurface.h"
+ extern "C" bool whyred_a509_display_copy(IOMemoryDescriptor *,uintptr_t,uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint64_t *);
++struct wa509_layer {IOMemoryDescriptor *md;uintptr_t va;uint64_t off;uint32_t w,h,sp,sx,dx,dy;};
++extern "C" bool whyred_a509_compose(const wa509_layer *,unsigned,uint32_t,uint32_t,uint32_t,uint64_t,uint64_t *);
++extern "C" const uint8_t *whyred_a509_scanout_view(uint64_t);
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_console_retarget(vm_offset_t va);   /* osfmk/console/video_console.c */
+@@ -198,6 +201,8 @@
+ 	uint32_t      fBootSrc, fBootStride;
+ 	bool          directPresent(const uint8_t *rec);
+ 	IOLock       *fA509PresentLock;
++	bool          fA509Compose;
++	bool          a509Compose(const uint8_t *rec);
+ 	bool          a509Present(SweetSurface *s, uint32_t ox, uint32_t oy);
+ 	/*
+ 	 * Direct frames go to a thread of ours (presenter): SwapEnd returns at once and backboardd is
+@@ -374,7 +379,8 @@
+ 		    fCtl0[0x00 / 4], fCtl0[0x14 / 4], fCtl0[0x18 / 4]);
+ 	}
+ 	uint32_t a509fb=0;
+-	fA509PresentLock = PE_parse_boot_argn("a509fb", &a509fb, sizeof(a509fb)) && a509fb==1 ? IOLockAlloc() : NULL;
++	fA509PresentLock = PE_parse_boot_argn("a509fb", &a509fb, sizeof(a509fb)) && a509fb>=1 && a509fb<=3 ? IOLockAlloc() : NULL;
++	fA509Compose = fA509PresentLock && a509fb>=2;
+ 	topaz_adreno_init();
+ 	setProperty("RedwoodWaitsForGPU", true);         /* present() waits for the GPU (eagl.c reads it) */
+ 	/*
+@@ -1338,11 +1344,60 @@
+         if (!fPowerOff && output && output<0x100000000ULL) {
+             scanFrom(output,pitch);ok=true;
+             IOLockLock(fLock);
+-            if (fLastSurf!=s) {s->retain();if(fLastSurf)fLastSurf->release();fLastSurf=s;}
+-            fLastVA=(const uint8_t *)(va+off+(uint64_t)ox*4);fLastStride=s->bytesPerRow;
++            OSSafeReleaseNULL(fLastSurf);
++            fLastVA=whyred_a509_scanout_view(output);fLastStride=pitch;
+             IOLockUnlock(fLock);
+         }
+     }
++    IOLockUnlock(fA509PresentLock);return ok;
++}
++
++/* Original framebuffer semantics: opaque layers, same order as CPU path.
++ * Do not infer alpha, transforms or scaling from private swap records. */
++bool
++AppleCLCD::a509Compose(const uint8_t *rec)
++{
++    if(!fA509PresentLock || !fVig0 || !fCtl0 || fPowerOff || !IOLockTryLock(fA509PresentLock))return false;
++    SweetSurface *held[4]={};wa509_layer layers[4]={};unsigned n=0;
++    bool valid=true,ok=false;uint32_t mask=get32(rec,0x104);
++    uint32_t pitch=(fWidth*4U+63U)&~63U;
++    for(unsigned i=0;i<4 && valid;i++){
++        uint32_t id=get32(rec,0x54+4*i);
++        if(!(mask&(1U<<i)) || !id)continue;
++        auto *s=held[i]=sweet_surface_copy(id);
++        if(!s || s==fSurface || s->gpuPool || s->wrapped || s->planeCount>1 || s->bytesPerElement!=4 ||
++            s->elementWidth!=1 || s->elementHeight!=1 || s->pixelFormat!=0x42475241U || !s->memory ||
++            s->width>4096 || s->height>4096){valid=false;break;}
++        const uint8_t *a=rec+0x64+16*i,*b=rec+0xc4+16*i;
++        int64_t sx=(int32_t)get32(a,0),sy=(int32_t)get32(a,4),dx=(int32_t)get32(b,0),dy=(int32_t)get32(b,4);
++        int64_t w=(int32_t)get32(b,8),h=(int32_t)get32(b,12);
++        // Strictly reject scaled or malformed rectangles; CPU retains handling.
++        if(w<=0 || h<=0 || sx<0 || sy<0 || dx<0 || dy<0 ||
++            w!=(int32_t)get32(a,8) || h!=(int32_t)get32(a,12) || w>4096 || h>4096){valid=false;break;}
++        dx-=fOffX;dy-=fOffY;
++        if(dx<0){sx-=dx;w+=dx;dx=0;}
++        if(dy<0){sy-=dy;h+=dy;dy=0;}
++        if(w>(int64_t)s->width-sx)w=(int64_t)s->width-sx;
++        if(h>(int64_t)s->height-sy)h=(int64_t)s->height-sy;
++        if(w>(int64_t)fWidth-dx)w=(int64_t)fWidth-dx;
++        if(h>(int64_t)fHeight-dy)h=(int64_t)fHeight-dy;
++        if(w<=0 || h<=0)continue;
++        uintptr_t va=s->kernelAddress();
++        if(!va || !s->bytesPerRow || s->bytesPerRow>8192 || (s->bytesPerRow&63)){valid=false;break;}
++        (void)topaz_surface_drawn(s,100);
++        layers[n++]={s->memory,va,(uint64_t)s->offset+(uint64_t)sy*s->bytesPerRow,
++            (uint32_t)w,(uint32_t)h,s->bytesPerRow,(uint32_t)sx,(uint32_t)dx,(uint32_t)dy};
++    }
++    uint32_t current=fVig0[0x14/4];uint64_t output=0;
++    if(valid && n>=2 && current==fScanPhys && !(fCtl0[0x18/4]&0x20001U) &&
++        whyred_a509_compose(layers,n,fWidth,fHeight,pitch,current,&output)) {
++        const uint8_t *view=whyred_a509_scanout_view(output);
++        if(!fPowerOff && view && output<0x100000000ULL){
++            scanFrom(output,pitch);ok=true;
++            IOLockLock(fLock);OSSafeReleaseNULL(fLastSurf);fLastVA=view;fLastStride=pitch;IOLockUnlock(fLock);
++        }
++    }
++    for(auto *s:held)if(s)s->release();
+     IOLockUnlock(fA509PresentLock);return ok;
+ }
+ 
+@@ -1442,7 +1497,7 @@
+ 		return;
+ 	}
+ 	fConsShown = false;
+-	if (directPresent(rec)) {
++	if (directPresent(rec) || (fA509Compose && a509Compose(rec))) {
+ 		if (!fConsolePaused) {
+ 			int quiet = 0;
+ 			fConsolePaused = true;
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -527,11 +527,73 @@
+     return wa509_poll(cc,WGPUCC_RCG,0x80000001U,0) &&
+         (wgpu_mmio_read(cc,WGPUCC_RCG+4)&0x371fU)==cfg;
+ }
++/* 1037: dynamic frequency selection (DFS), NOT voltage scaling. Only
++ * after the validated 160 MHz configuration. Keep PLL0 running, switch
++ * the idle GFX3D RCG between XO and the stock 160 MHz parent/divider.
++ * No voltage/MEMACC changes. All callers serialize with the GPU ring. */
++static uint32_t wa509_dfs_mode,wa509_dfs_current,wa509_dfs_up,wa509_dfs_down,wa509_dfs_fail;
++static vm_offset_t wa509_dfs_cc,wa509_dfs_gpu;
++bool whyred_a509_clock_dynamic(void);
++bool whyred_a509_clock_dynamic(void)
++{
++    return __atomic_load_n(&wa509_dfs_mode,__ATOMIC_ACQUIRE)==1;
++}
++bool whyred_a509_clock_select(bool fast);
++bool whyred_a509_clock_select(bool fast)
++{
++    if(!whyred_a509_clock_dynamic())return __atomic_load_n(&wa509_dfs_current,__ATOMIC_ACQUIRE)!=3;
++    lck_mtx_lock(&wgpu_lock);
++    uint32_t want=fast?2U:1U,old=__atomic_load_n(&wa509_dfs_current,__ATOMIC_RELAXED);
++    bool ok=true;
++    if(old==want)goto out;
++    if(old!=1 && old!=2){ok=false;goto out;}
++    if(!wa509_dfs_cc || !wa509_dfs_gpu || !whyred_gpu_rails_ready()) {ok=false;goto stop;}
++    vm_offset_t cc=wa509_dfs_cc,gpu=wa509_dfs_gpu;
++    {
++        uint32_t cx=wgpu_mmio_read(cc,WGPUCC_CX),gx=wgpu_mmio_read(cc,WGPUCC_GX),
++            gate=wgpu_mmio_read(cc,WGPUCC_GFX3D),status=wgpu_mmio_read(gpu,0x4f5U*4),
++            rp=wgpu_mmio_read(gpu,0x806U*4),wp=wgpu_mmio_read(gpu,0x807U*4),
++            pll=wgpu_mmio_read(cc,0x1000),cfg=wgpu_mmio_read(cc,WGPUCC_RCG+4),
++            root=wgpu_mmio_read(cc,WGPUCC_RCG);
++        if(cx==0xffffffffU || gx==0xffffffffU || gate==0xffffffffU || status==0xffffffffU ||
++            rp==0xffffffffU || wp==0xffffffffU || pll==0xffffffffU || cfg==0xffffffffU || root==0xffffffffU ||
++            !(cx&WGPU_PWR_ON) || !(gx&WGPU_PWR_ON) || (gate&WGATE_OFF) || (status&(1U<<31)) || rp!=wp ||
++            (pll&0x80000007U)!=0x80000007U || (root&0x80000001U) || (cfg&0x371fU)!=(old==2?0x103U:1U)){
++            ok=false;goto stop;
++        }
++        if(!wa509_clock_root(cc,fast?0x103U:1U)){
++            // No further jobs unless the old clock configuration is known.
++            if(!wa509_clock_root(cc,old==2?0x103U:1U))__atomic_store_n(&wa509_dfs_current,3,__ATOMIC_RELEASE);
++            ok=false;goto stop;
++        }
++        __atomic_store_n(&wa509_dfs_current,want,__ATOMIC_RELEASE);
++        if(fast)__atomic_add_fetch(&wa509_dfs_up,1,__ATOMIC_RELAXED);else __atomic_add_fetch(&wa509_dfs_down,1,__ATOMIC_RELAXED);
++        goto out;
++    }
++ stop:
++    // Conservative fail-closed for new submissions, even if rollback worked.
++    __atomic_add_fetch(&wa509_dfs_fail,1,__ATOMIC_RELAXED);
++    __atomic_store_n(&wa509_dfs_current,3,__ATOMIC_RELEASE);
++    __atomic_store_n(&wa509_dfs_mode,0,__ATOMIC_RELEASE);
++ out:
++    lck_mtx_unlock(&wgpu_lock);return ok;
++}
++static int wa509_dfs_status_sysctl SYSCTL_HANDLER_ARGS
++{
++    if(req->newptr)return EPERM;
++    char out[128];snprintf(out,sizeof(out),"enabled=%u state=%u up=%u down=%u fail=%u (state 1=XO,2=160MHz,3=stopped)",
++        __atomic_load_n(&wa509_dfs_mode,__ATOMIC_ACQUIRE),__atomic_load_n(&wa509_dfs_current,__ATOMIC_ACQUIRE),
++        __atomic_load_n(&wa509_dfs_up,__ATOMIC_RELAXED),__atomic_load_n(&wa509_dfs_down,__ATOMIC_RELAXED),__atomic_load_n(&wa509_dfs_fail,__ATOMIC_RELAXED));
++    return SYSCTL_OUT(req,out,strlen(out)+1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_dfs_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL,0,wa509_dfs_status_sysctl,"A","A509 idle/busy frequency transitions; fixed voltage");
++
+ bool whyred_a509_clock_prepare(void);
+ bool whyred_a509_clock_prepare(void)
+ {
+     uint32_t on=0;
+-    if (!PE_parse_boot_argn("a509clk",&on,sizeof(on)) || on!=1) return true;
++    if (!PE_parse_boot_argn("a509clk",&on,sizeof(on)) || on<1 || on>2) return true;
+     if (!whyred_gpu_rails_ready() || __atomic_load_n(&wa509_state,__ATOMIC_ACQUIRE)!=4) return true;
+     lck_mtx_lock(&wgpu_lock);
+     vm_offset_t cc=ml_io_map(WGPUCC_BASE,WGPUCC_SIZE),acc=ml_io_map(0x01fcc000UL,0x4000),gpu=0;
+@@ -562,7 +624,9 @@
+     if (!wa509_rmw(cc,pll,0,4U) || !wa509_poll(cc,pll,1U<<31,1U<<31) || !wa509_rmw(cc,pll,0,1U)) goto rollback;
+     switched=true;
+     if (!wa509_clock_root(cc,0x103U)) goto rollback;
+-    state=2;goto done;
++    state=2;
++    if(on==2){wa509_dfs_cc=cc;wa509_dfs_gpu=gpu;__atomic_store_n(&wa509_dfs_current,2,__ATOMIC_RELEASE);__atomic_store_n(&wa509_dfs_mode,1,__ATOMIC_RELEASE);}
++    goto done;
+  rollback:
+     if (switched && !wa509_clock_root(cc,old_root&0x371fU)) {state=4;ok=false;goto done;}
+     if (modified) {
+@@ -596,6 +660,18 @@
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_display_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, wa509_display_status_sysctl, "A", "A509 native display copy statistics");
+ 
++extern uint64_t whyred_a509_compose_status(unsigned);
++static int wa509_compose_status_sysctl SYSCTL_HANDLER_ARGS
++{
++    if(req->newptr)return EPERM;
++    char out[192];snprintf(out,sizeof(out),"frames=%llu layers=%llu skip=%llu last_us=%llu max_us=%llu",
++        (unsigned long long)whyred_a509_compose_status(0),(unsigned long long)whyred_a509_compose_status(1),
++        (unsigned long long)whyred_a509_compose_status(2),(unsigned long long)(whyred_a509_compose_status(3)/1000),
++        (unsigned long long)(whyred_a509_compose_status(4)/1000));
++    return SYSCTL_OUT(req,out,strlen(out)+1);
++}
++SYSCTL_PROC(_kern,OID_AUTO,whyred_gpu_compose_state,CTLTYPE_STRING|CTLFLAG_RD|CTLFLAG_LOCKED,
++    NULL,0,wa509_compose_status_sysctl,"A","A509 opaque compositor statistics (not full QuartzCore rendering)");
+ static int
+ wa509_power_status SYSCTL_HANDLER_ARGS
+ {

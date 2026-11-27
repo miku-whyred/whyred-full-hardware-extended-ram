@@ -1,0 +1,488 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -23,6 +23,8 @@
+ #include <IOKit/IOKitKeys.h>
+ #include <IOKit/IOPlatformExpert.h>
+ #include <kern/clock.h>
++#include <kern/sched_prim.h>
++#include <kern/thread.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
+@@ -1814,17 +1816,410 @@
+     svc->release();
+ }
+ 
++/* 1035 V10: two independent privileged software contexts, round-robin
++ * worker and one hardware ring. Permanent disjoint data mappings; no
++ * arbitrary packets or IOVA input. Each slot is leased once per boot;
++ * do not recycle a slot while old mappings may still exist. */
++static constexpr uint32_t wa509_direct_bytes=12U*1024U*1024U;
++static constexpr unsigned wa509_contexts=2;
++static constexpr uint64_t wa509_direct_va[4]={0x41000000ULL,0x42000000ULL,0x43000000ULL,0x44000000ULL};
++static IOBufferMemoryDescriptor *wa509_direct_bo[4];
++static whyred_a509_buffer wa509_direct_pt[4][6];
++static uint8_t *wa509_direct_cpu[4];
++static IOLock *wa509_direct_lock;
++static vm_offset_t wa509_direct_gpu,wa509_direct_cb;
++static uint32_t wa509_direct_wp,wa509_direct_seq=0xa50d0000U;
++static bool wa509_direct_claimed[wa509_contexts],wa509_direct_dead;
++static unsigned wa509_rr;
++static uint32_t wa509_work_event;
++struct wa509_direct_job {uint32_t w,h,pitch,seq,state;uint64_t ns;};
++static wa509_direct_job wa509_jobs[wa509_contexts];
++static bool wa509_observed[wa509_contexts];
++/* State: 0 idle, 1 queued, 2 running, 3 done, 4 fault. */
++static bool wa509_direct_range(uint64_t pa,uint64_t size)
++{
++    if (!pa || (pa&4095) || size>0x100000000ULL || pa>0x100000000ULL-size) return false;
++    uint64_t end=pa+size;
++    return (pa>=0xa2000000ULL && end<=0xf4000000ULL) ||
++        (pa>=0x48000000ULL && end<=0x85600000ULL) ||
++        (pa>=0x88f00000ULL && end<=0x8ac00000ULL);
++}
++static bool wa509_direct_geometry(uint64_t w,uint64_t h,uint64_t pitch)
++{
++    return w && w<=2048 && h && h<=2436 && pitch>=w*4 && pitch<=8192 &&
++        !(pitch&63) && pitch*h<=wa509_direct_bytes;
++}
++/* Extend the existing L2 table, before SID0 is installed. Map scattered
++ * wired XNU pages to contiguous 4 KiB IOVAs. The two windows are separated
++ * by 4 MiB of unmapped VA, and source pages are GPU read-only. */
++static bool wa509_direct_tables(void)
++{
++    uint64_t *l2=(uint64_t *)wa509_cp.l2.va;
++    if (!l2 || PAGE_SIZE!=16384) return false;
++    for (unsigned b=0;b<2*wa509_contexts;b++) {
++        wa509_direct_bo[b]=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++            kIODirectionInOut|kIOMemoryKernelUserShared|kIOMapWriteCombineCache,
++            wa509_direct_bytes,PAGE_SIZE);
++        if (!wa509_direct_bo[b]) return false;
++        wa509_direct_cpu[b]=(uint8_t *)wa509_direct_bo[b]->getBytesNoCopy();
++        if (!wa509_direct_cpu[b]) return false;
++        bzero(wa509_direct_cpu[b],wa509_direct_bytes);
++        for (unsigned t=0;t<6;t++) {
++            unsigned idx=(unsigned)(((wa509_direct_va[b]>>21)&511)+t);
++            if (l2[idx] || !whyred_a509_alloc(&wa509_direct_pt[b][t],PAGE_SIZE)) return false;
++            uint64_t *pt=(uint64_t *)wa509_direct_pt[b][t].va;
++            for (unsigned i=0;i<512;i+=PAGE_SIZE/4096) {
++                uint64_t off=(uint64_t)t*0x200000ULL+(uint64_t)i*4096;
++                IOByteCount span=0;
++                uint64_t pa=wa509_direct_bo[b]->getPhysicalSegment(off,&span,kIOMemoryMapperNone);
++                if (span<PAGE_SIZE || (pa&(PAGE_SIZE-1)) || !wa509_direct_range(pa,PAGE_SIZE)) return false;
++                for (unsigned j=0;j<PAGE_SIZE/4096;j++)
++                    pt[i+j]=(pa+4096ULL*j)|3ULL|(1ULL<<6)|(2ULL<<8)|(1ULL<<10)|
++                        (3ULL<<53)|(!(b&1)?(1ULL<<7):0);
++            }
++            l2[idx]=wa509_direct_pt[b][t].pa|3ULL;
++        }
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    return true;
++}
++/* Optional A509 completion interrupt. DT SPI 300 -> GIC INTID 332.
++ * Never claim an already enabled line; do not change secure group bits,
++ * trigger mode or global GIC settings. Polling remains a watchdog fallback.
++ * Source: Android live DT, Linux v6.12 a5xx.xml/adreno_pm4.xml/a5xx_gpu.c,
++ * ARM GICv3 distributor layout. Enable only after both DMA selftests. */
++static constexpr uint32_t wa509_irq_id=332,wa509_irq_mask=1U<<20;
++static uintptr_t wa509_irq_gpu,wa509_irq_gic;
++static uint32_t wa509_irq_count,wa509_irq_stray;
++static unsigned wa509_irq_enabled;
++extern "C" int whyred_a509_irq(unsigned int intid);
++int whyred_a509_irq(unsigned int intid)
++{
++    if (intid!=wa509_irq_id || !__atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE)) return 0;
++    vm_offset_t gpu=wa509_irq_gpu;
++    uint32_t st=wa509_cp_gr(gpu,0x4e1);
++    if (st!=0xffffffffU && (st&wa509_irq_mask)) {
++        wa509_cp_gw(gpu,0x0037,wa509_irq_mask);
++        __atomic_add_fetch(&wa509_irq_count,1,__ATOMIC_RELEASE);
++    } else {
++        // Unexpected assertion: mask our own source/line before EOI.
++        wa509_cp_gw(gpu,0x0038,0);
++        wa509_cp_wr(wa509_irq_gic,0x180+4*(wa509_irq_id/32),1U<<(wa509_irq_id%32));
++        __atomic_add_fetch(&wa509_irq_stray,1,__ATOMIC_RELEASE);
++        __atomic_store_n(&wa509_irq_enabled,0,__ATOMIC_RELEASE);
++    }
++    thread_wakeup((event_t)&wa509_irq_count);
++    return 1;
++}
++static bool wa509_irq_setup(vm_offset_t gpu)
++{
++    uint32_t on=0;
++    if (!PE_parse_boot_argn("whyred_gpu_irq",&on,sizeof(on)) || on!=1) return false;
++    vm_offset_t gic=ml_io_map(0x17a00000,0x10000);
++    if (!gic) return false;
++    const uint32_t id=wa509_irq_id, bit=1U<<(id%32), word=4*(id/32);
++    uint32_t ctl=wa509_cp_rd(gic,0), typer=wa509_cp_rd(gic,4);
++    if (ctl==0xffffffffU || typer==0xffffffffU || !(ctl&0x10U) || ((typer&31)+1)*32<=id ||
++        (wa509_cp_rd(gic,0x100+word)&bit) || (wa509_cp_rd(gic,0x300+word)&bit) ||
++        (wa509_cp_rd(gic,0x200+word)&bit) ||
++        (wa509_cp_rd(gic,0xc00+4*(id/16))&(2U<<(2*(id%16))))) return false;
++    // Preserve priority; require it to be nonzero and usable as NS.
++    volatile uint8_t *priority=(volatile uint8_t *)(gic+0x400+id);
++    uint8_t oldp=*priority;
++    if (oldp==0xffU) return false;
++    uint32_t route=0x6000+8*id;
++    volatile uint64_t *r=(volatile uint64_t *)(gic+route);
++    uint64_t oldroute=*r, mpidr;
++    if (oldroute==~0ULL) return false;
++    __asm__ volatile("mrs %0, mpidr_el1":"=r"(mpidr));
++    uint64_t target=mpidr&0xff00ffffffULL;
++    *r=target; __asm__ volatile("dsb sy" ::: "memory");
++    *priority=0xa0U; __asm__ volatile("dsb sy" ::: "memory");
++    if ((*r&0xff80ffffffULL)!=target || (*priority&0xe0U)!=0xa0U) {
++        *r=oldroute;*priority=oldp;__asm__ volatile("dsb sy" ::: "memory");return false;
++    }
++    wa509_cp_gw(gpu,0x0038,0);
++    wa509_cp_gw(gpu,0x0037,wa509_irq_mask);
++    wa509_irq_gpu=gpu;wa509_irq_gic=gic;
++    __atomic_store_n(&wa509_irq_enabled,1,__ATOMIC_RELEASE);
++    wa509_cp_wr(gic,0x100+word,bit);
++    if (!(wa509_cp_rd(gic,0x100+word)&bit)) {
++        __atomic_store_n(&wa509_irq_enabled,0,__ATOMIC_RELEASE);
++        wa509_cp_wr(gic,0x180+word,bit);*r=oldroute;*priority=oldp;__asm__ volatile("dsb sy" ::: "memory");return false;
++    }
++    wa509_cp_gw(gpu,0x0038,wa509_irq_mask);
++    if ((wa509_cp_gr(gpu,0x0038)&wa509_irq_mask)==0) {
++        wa509_cp_gw(gpu,0x0038,0);wa509_cp_wr(gic,0x180+word,bit);
++        __atomic_store_n(&wa509_irq_enabled,0,__ATOMIC_RELEASE);
++        *r=oldroute;*priority=oldp;__asm__ volatile("dsb sy" ::: "memory");return false;
++    }
++    IOLog("A509: IRQ_ROUTE_ARMED INTID=332; actual delivery not yet verified\n");
++    return true;
++}
++static void wa509_irq_wait(uint32_t observed)
++{
++    // Register wait then recheck generation to close lost-wakeup race.
++    uint64_t deadline;clock_interval_to_deadline(1,NSEC_PER_MSEC,&deadline);
++    if (assert_wait_deadline((event_t)&wa509_irq_count,THREAD_UNINT,deadline)!=THREAD_WAITING) return;
++    if (observed!=__atomic_load_n(&wa509_irq_count,__ATOMIC_ACQUIRE) ||
++        !__atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE)) {
++        clear_wait(current_thread(),THREAD_AWAKENED);
++    }
++    thread_block(THREAD_CONTINUE_NULL);
++}
++extern "C" uint32_t whyred_a509_irq_status(unsigned int which);
++uint32_t whyred_a509_irq_status(unsigned int which)
++{
++    if (which==0) return __atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE);
++    if (which==1) return __atomic_load_n(&wa509_irq_count,__ATOMIC_ACQUIRE);
++    return __atomic_load_n(&wa509_irq_stray,__ATOMIC_ACQUIRE);
++}
++
++/* Hardware ARRAY_PITCH is 16 bits in units of 64 bytes. Split a frame
++ * into stripes within that bound; one ring submission and one final fence. */
++static bool wa509_direct_copy(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp,
++    uint32_t w,uint32_t h,uint32_t pitch,uint32_t seq,unsigned slot)
++{
++    if (slot>=wa509_contexts || !wa509_direct_geometry(w,h,pitch) || !seq || wp>=8192 ||
++        wa509_cp.ring.size!=32768 || wa509_cp_gr(gpu,0x806)!=wp || wa509_cp_gr(gpu,0x807)!=wp) return false;
++    uint32_t *rb=(uint32_t *)wa509_cp.ring.va;
++    volatile uint32_t *f=(volatile uint32_t *)wa509_cp.fence.va;
++    uint32_t p=wp, words=0;
++    f[1]=0;
++    auto emit=[&](uint32_t x){rb[p]=x;p=(p+1U)&8191U;words++;};
++    auto reg=[&](uint32_t r,uint32_t x){emit(wa509_pkt4(r,1));emit(x);};
++    auto packet=[&](uint32_t op,uint32_t cnt){emit(whyred_a509_pkt7(op,cnt));};
++    emit(wa509_pkt4(0x0e91,5));emit(0);emit(0);emit(0);emit(0);emit(0x12);
++    packet(0x26,0);
++    const uint32_t setup[][2]={{0xe141,8},{0x2100,0x86000000},{0x2180,0x86000000},{0x2184,9},
++        {0xe140,1U<<17},{0x0cc6,4},{0x0ec2,12},{0x0f02,0x344},{0x0e06,2},{0xe000,0x181}};
++    for (auto &pair:setup) reg(pair[0],pair[1]);
++    uint32_t maxrows=(65535U*64U)/pitch;
++    if (!maxrows || (h+maxrows-1)/maxrows>8) return false;
++    for (uint32_t y=0;y<h;) {
++        uint32_t rows=h-y; if (rows>maxrows) rows=maxrows;
++        packet(0x6c,1);emit(5);
++        for (unsigned i=0;i<2;i++) {
++            uint64_t a=wa509_direct_va[2*slot+i]+(uint64_t)y*pitch;
++            emit(wa509_pkt4(i?0x2110:0x2107,9));
++            emit(0x30);emit((uint32_t)a);emit((uint32_t)(a>>32));
++            emit((pitch>>6)|(((pitch*rows)>>6)<<16));
++            for (unsigned j=0;j<5;j++) emit(0);
++            reg(i?0x2182:0x2181,0x30);
++        }
++        uint32_t rect=(w-1)|((rows-1)<<16);
++        packet(0x2c,5);emit(1);emit(0);emit(rect);emit(0);emit(rect);
++        packet(0x6c,1);emit(8);packet(0x26,0);
++        y+=rows;
++    }
++    uint64_t fence=wa509_iova[3]+4;
++    packet(0x46,4);emit(0x1d);emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(0);
++    packet(0x46,4);emit(4U|(__atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE)?(1U<<31):0));emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(seq);
++    packet(0x26,0);
++    if (words>=1024) return false;
++    __asm__ volatile("dsb sy" ::: "memory");
++    wa509_cp_gw(gpu,0x0807,p);
++    uint64_t deadline;clock_interval_to_deadline(1000,NSEC_PER_MSEC,&deadline);
++    for (unsigned n=0;;n++) {
++        uint32_t observed=__atomic_load_n(&wa509_irq_count,__ATOMIC_ACQUIRE);
++        uint32_t fsr=wa509_cp_rd(cb,0x58),fault=wa509_cp_gr(gpu,0xb1a),
++            rp=wa509_cp_gr(gpu,0x806),status=wa509_cp_gr(gpu,0x4f5);
++        if (fsr || fault || rp==0xffffffffU || status==0xffffffffU) return false;
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (rp==p && !(status&(1U<<31)) && f[1]==seq) {wp=p;return true;}
++        if (mach_absolute_time()>=deadline) return false;
++        if (n<40) IODelay(10);
++        else if (__atomic_load_n(&wa509_irq_enabled,__ATOMIC_ACQUIRE)) wa509_irq_wait(observed);
++        else IOSleep(1);
++    }
++}
++static bool wa509_direct_selftest(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp)
++{
++    constexpr uint32_t w=1080,h=2160,pitch=4352;
++    // Exercise BOTH arenas and distinct data. No user service on failure.
++    for (unsigned slot=0;slot<wa509_contexts;slot++) {
++        auto *src=(uint32_t *)wa509_direct_cpu[2*slot];
++        auto *dst=(volatile uint32_t *)wa509_direct_cpu[2*slot+1];
++        for (unsigned pass=0;pass<2;pass++) {
++            for (uint32_t i=0;i<wa509_direct_bytes/4;i++) {
++                uint32_t v=i*0x9e3779b9U+(pass+2*slot)*0x85ebca6bU;
++                src[i]=(v^(v>>16))|0xff000000U;dst[i]=0xdeadbeefU;
++            }
++            if (!wa509_direct_copy(gpu,cb,wp,w,h,pitch,++wa509_direct_seq,slot)) return false;
++            __asm__ volatile("dsb sy" ::: "memory");
++            for (uint32_t i=0;i<wa509_direct_bytes/4;i++) {
++                bool active=i<(pitch/4)*h && (i%(pitch/4))<w;
++                if (dst[i]!=(active?src[i]:0xdeadbeefU)) {
++                    IOLog("A509: DIRECT_PIXEL_MISMATCH slot=%u idx=%u\n",slot,i);return false;
++                }
++            }
++        }
++        bzero(wa509_direct_cpu[2*slot],wa509_direct_bytes);
++        bzero(wa509_direct_cpu[2*slot+1],wa509_direct_bytes);
++    }
++    return true;
++}
++static int wa509_next_job(void)
++{
++    for (unsigned i=0;i<wa509_contexts;i++) {
++        unsigned slot=(wa509_rr+i)%wa509_contexts;
++        if (wa509_jobs[slot].state==1) {wa509_rr=(slot+1)%wa509_contexts;return (int)slot;}
++    }
++    return -1;
++}
++static void wa509_direct_worker(__unused void *arg,__unused wait_result_t wr)
++{
++    IOLockLock(wa509_direct_lock);
++    for (;;) {
++        int slot;
++        while ((slot=wa509_next_job())<0) IOLockSleep(wa509_direct_lock,&wa509_work_event,THREAD_UNINT);
++        auto &j=wa509_jobs[slot];
++        auto work=j;j.state=2;
++        IOLockUnlock(wa509_direct_lock);
++        uint64_t start=mach_absolute_time(),ns=0;
++        bool ok=wa509_direct_copy(wa509_direct_gpu,wa509_direct_cb,wa509_direct_wp,
++            work.w,work.h,work.pitch,work.seq,(unsigned)slot);
++        absolutetime_to_nanoseconds(mach_absolute_time()-start,&ns);
++        IOLockLock(wa509_direct_lock);
++        j.ns=ns;j.state=ok?3:4;
++        if (!ok) {
++            wa509_direct_dead=true;wa509_cp_mark(117);
++            // No other job may be submitted to a possibly wedged GPU.
++            for (unsigned i=0;i<wa509_contexts;i++) {
++                if (wa509_jobs[i].state==1) wa509_jobs[i].state=4;
++                IOLockWakeup(wa509_direct_lock,&wa509_jobs[i],false);
++            }
++        }
++        IOLockWakeup(wa509_direct_lock,&j,false);
++    }
++}
++class WhyredA509DirectService : public IOService {
++    OSDeclareDefaultStructors(WhyredA509DirectService);
++public: bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(WhyredA509DirectService,IOService);
++class WhyredA509DirectClient : public IOUserClient {
++    OSDeclareDefaultStructors(WhyredA509DirectClient);
++    int fSlot=-1;bool fClosed=false;
++public:
++    bool initWithTask(task_t task,void *securityID,UInt32 type,OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++    IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *args,
++        IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(WhyredA509DirectClient,IOUserClient);
++bool WhyredA509DirectService::start(IOService *provider)
++{
++    if (!IOService::start(provider)) return false;
++    setProperty(kIOUserClientClassKey,"WhyredA509DirectClient");setName("WhyredA509DirectService");registerService();return true;
++}
++bool WhyredA509DirectClient::initWithTask(task_t task,void *securityID,UInt32 type,OSDictionary *properties)
++{
++    fSlot=-1;fClosed=false;
++    return type==0 && task && clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)==kIOReturnSuccess &&
++        IOUserClient::initWithTask(task,securityID,type,properties);
++}
++bool WhyredA509DirectClient::start(IOService *provider)
++{
++    if (!wa509_direct_lock || !IOUserClient::start(provider)) return false;
++    IOLockLock(wa509_direct_lock);
++    if (!wa509_direct_dead) {
++        for (unsigned i=0;i<wa509_contexts;i++) {
++            if (!wa509_direct_claimed[i]) {wa509_direct_claimed[i]=true;fSlot=(int)i;break;}
++        }
++    }
++    IOLockUnlock(wa509_direct_lock);return fSlot>=0;
++}
++IOReturn WhyredA509DirectClient::clientClose(void)
++{
++    IOLockLock(wa509_direct_lock);fClosed=true;
++    if (fSlot>=0 && wa509_jobs[fSlot].state==1) {
++        wa509_jobs[fSlot].state=4;
++        IOLockWakeup(wa509_direct_lock,&wa509_jobs[fSlot],false);
++    }
++    IOLockUnlock(wa509_direct_lock);
++    if (!isInactive()) terminate();return kIOReturnSuccess;
++}
++IOReturn WhyredA509DirectClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
++{
++    if (!options || !memory || type<1 || type>2) return kIOReturnBadArgument;
++    IOLockLock(wa509_direct_lock);
++    if (fSlot<0 || fClosed || wa509_direct_dead) {IOLockUnlock(wa509_direct_lock);return kIOReturnNotReady;}
++    auto *bo=wa509_direct_bo[2*fSlot+type-1];bo->retain();*memory=bo;*options=kIOMapWriteCombineCache;
++    IOLockUnlock(wa509_direct_lock);return kIOReturnSuccess;
++}
++/* ABI 2: query [2,maxW,maxH,bytes], submit [w,h,pitch]->[seq],
++ * poll [seq]->[state,elapsed_ns], wait [seq]->[state,elapsed_ns].
++ * Caller must not touch either BO from submit until state 3 or 4. */
++IOReturn WhyredA509DirectClient::externalMethod(uint32_t selector,IOExternalMethodArguments *a,
++    __unused IOExternalMethodDispatch *dispatch,__unused OSObject *target,__unused void *reference)
++{
++    if (!a || a->structureInputSize || a->structureOutputSize || a->structureInputDescriptor ||
++        a->structureOutputDescriptor || !a->scalarOutput || selector>3) return kIOReturnBadArgument;
++    const uint32_t in[]={0,3,1,1},out[]={4,1,2,2};
++    if (a->scalarInputCount!=in[selector] || a->scalarOutputCount!=out[selector] ||
++        (in[selector]&&!a->scalarInput)) return kIOReturnBadArgument;
++    IOLockLock(wa509_direct_lock);
++    IOReturn ret=kIOReturnSuccess;
++    if (fSlot<0 || fClosed) {IOLockUnlock(wa509_direct_lock);return kIOReturnNotReady;}
++    auto &wa509_job=wa509_jobs[fSlot];
++    if (selector==0) {a->scalarOutput[0]=2;a->scalarOutput[1]=2048;a->scalarOutput[2]=2436;a->scalarOutput[3]=wa509_direct_bytes;}
++    else if (selector==1) {
++        uint64_t w=a->scalarInput[0],h=a->scalarInput[1],pitch=a->scalarInput[2];
++        if (wa509_direct_dead) ret=kIOReturnNotReady;
++        else if (!wa509_direct_geometry(w,h,pitch)) ret=kIOReturnBadArgument;
++        else if (wa509_job.state==1 || wa509_job.state==2 || (wa509_job.state==3 && !wa509_observed[fSlot])) ret=kIOReturnBusy;
++        else {
++            uint32_t seq=++wa509_direct_seq;if (!seq) seq=++wa509_direct_seq;
++            __asm__ volatile("dsb sy" ::: "memory");
++            wa509_job={(uint32_t)w,(uint32_t)h,(uint32_t)pitch,seq,1,0};
++            wa509_observed[fSlot]=false;
++            a->scalarOutput[0]=seq;IOLockWakeup(wa509_direct_lock,&wa509_work_event,false);
++        }
++    } else if (!wa509_job.seq || a->scalarInput[0]!=wa509_job.seq) ret=kIOReturnBadArgument;
++    else {
++        if (selector==3) {
++            uint64_t deadline;clock_interval_to_deadline(2300,NSEC_PER_MSEC,&deadline);
++            while (wa509_job.seq==a->scalarInput[0] && (wa509_job.state==1 || wa509_job.state==2)) {
++                if (IOLockSleepDeadline(wa509_direct_lock,&wa509_job,deadline,THREAD_UNINT)==THREAD_TIMED_OUT) break;
++            }
++        }
++        if (fClosed) ret=kIOReturnNotReady;
++        else if (wa509_job.seq!=a->scalarInput[0]) ret=kIOReturnBadArgument;
++        else {a->scalarOutput[0]=wa509_job.state;a->scalarOutput[1]=wa509_job.ns;
++            if (wa509_job.state>=3) wa509_observed[fSlot]=true;}
++    }
++    IOLockUnlock(wa509_direct_lock);return ret;
++}
++static bool wa509_direct_publish(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
++{
++    if (wa509_direct_lock || wp>=8192) return false;
++    wa509_direct_lock=IOLockAlloc();if (!wa509_direct_lock) return false;
++    wa509_direct_gpu=gpu;wa509_direct_cb=cb;wa509_direct_wp=wp;
++    (void)wa509_irq_setup(gpu);
++    thread_t thread;
++    if (kernel_thread_start(wa509_direct_worker,NULL,&thread)!=KERN_SUCCESS) return false;
++    thread_deallocate(thread);
++    IOService *provider=IOService::getPlatform();auto *svc=OSTypeAlloc(WhyredA509DirectService);
++    if (!svc || !provider || !svc->init() || !svc->attach(provider)) {OSSafeReleaseNULL(svc);return false;}
++    bool ok=svc->start(provider);if (!ok) svc->detach(provider);svc->release();
++    return ok;
++}
++
+ static void
+ whyred_a509_run_cp(void)
+ {
+     uint32_t enabled=0;
+-    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>4) return;
++    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>5) return;
+     if (__atomic_exchange_n(&wa509_cp_state,1,__ATOMIC_ACQ_REL)!=0) return;
+     auto &s=wa509_cp;
+     if (!whyred_a509_stage_fw("a530_pm4.fw",&s.pm4) || !whyred_a509_stage_fw("a530_pfp.fw",&s.pfp) ||
+         !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) ||
+-        (enabled>=3 && (!whyred_a509_alloc(&s.src,enabled==4?wa509_service_bytes:PAGE_SIZE) ||
+-            !whyred_a509_alloc(&s.dst,enabled==4?wa509_service_bytes:PAGE_SIZE))) || !wa509_cp_tables()) {
++        (enabled>=3 && (!whyred_a509_alloc(&s.src,enabled>=4?wa509_service_bytes:PAGE_SIZE) ||
++            !whyred_a509_alloc(&s.dst,enabled>=4?wa509_service_bytes:PAGE_SIZE))) || !wa509_cp_tables() ||
++        (enabled==5 && !wa509_direct_tables())) {
+         wa509_cp_mark(101); return;
+     }
+     wa509_cp_mark(2);
+@@ -1898,7 +2293,7 @@
+         wa509_cp_mark(9);
+         if (!wa509_blit_test(gpu,cb,wp)) {wa509_cp_mark(112);return;}
+         wa509_cp_mark(10);
+-        if (enabled==4) {
++        if (enabled>=4) {
+             // Exercise repeated submissions and the larger arena before publishing.
+             uint32_t *src=(uint32_t *)s.src.va,*dst=(uint32_t *)s.dst.va;
+             for (unsigned pass=0;pass<3;pass++) {
+@@ -1910,7 +2305,13 @@
+                 for (unsigned i=61440;i<65536;i++) if (((volatile uint32_t *)dst)[i]!=0xdeadbeef) bad++;
+                 if (bad) {IOLog("A509: SERVICE_PIXEL_MISMATCH=%u\n",bad);wa509_cp_mark(115);return;}
+             }
+-            wa509_service_publish(gpu,cb,wp);
++            if (enabled==4) wa509_service_publish(gpu,cb,wp);
++            else {
++                if (!wa509_direct_selftest(gpu,cb,wp)) {wa509_cp_mark(116);return;}
++                if (!wa509_direct_publish(gpu,cb,wp)) {wa509_cp_mark(118);return;}
++                wa509_cp_mark(12);
++                IOLog("A509: DIRECT_2D_READY ABI=2 dual-context async full-frame\n");
++            }
+         }
+     }
+     /* All buffers and mappings retained, even on failure. No arbitrary
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -2003,7 +2003,10 @@
+ 		cpu_signal_handler();
+ 	} else {
+ 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_OTHER);
+-		if (cdp->interrupt_handler) {
++		extern int whyred_a509_irq(unsigned int);
++		if (whyred_a509_irq(intid)) {
++			/* GPU source acknowledged by its dedicated handler. */
++		} else if (cdp->interrupt_handler) {
+ 			cdp->interrupt_handler(cdp->interrupt_target,
+ 			    cdp->interrupt_refCon,
+ 			    cdp->interrupt_nub,
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -494,6 +494,19 @@
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_cp_state, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     NULL, 0, wa509_cp_status_sysctl, "I", "A509 command processor and service state");
+ 
++extern uint32_t whyred_a509_irq_status(unsigned int);
++static int
++wa509_irq_status_sysctl SYSCTL_HANDLER_ARGS
++{
++    if (req->newptr) return EPERM;
++    char out[128];
++    snprintf(out,sizeof(out),"armed=%u completed_irq=%u stray=%u",
++        whyred_a509_irq_status(0),whyred_a509_irq_status(1),whyred_a509_irq_status(2));
++    return SYSCTL_OUT(req,out,strlen(out)+1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_irq_state, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, wa509_irq_status_sysctl, "A", "A509 optional completion interrupt status");
++
+ static int
+ wa509_power_status SYSCTL_HANDLER_ARGS
+ {
