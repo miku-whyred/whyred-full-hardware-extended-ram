@@ -1,0 +1,307 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -18,6 +18,11 @@
+  * 600 MHz instead of 300.
+  */
+ #include <IOKit/IOLib.h>
++#include <IOKit/IOService.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <kern/clock.h>
+ #include <IOKit/IOBufferMemoryDescriptor.h>
+ #include <IOKit/IOLocks.h>
+ #include <pexpert/pexpert.h>
+@@ -1556,7 +1561,7 @@
+ }
+ static uint32_t wa509_pixel(unsigned i) {return 0xff000000U|((i*37U)&255)|(((i*73U)&255)<<8)|(((i*109U)&255)<<16);}
+ static bool
+-wa509_blit_test(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
++wa509_blit_test(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp)
+ {
+     auto &s=wa509_cp;
+     uint32_t *src=(uint32_t *)s.src.va,*dst=(uint32_t *)s.dst.va,*rb=(uint32_t *)s.ring.va;
+@@ -1600,16 +1605,226 @@
+     return f[1]==0xa509b117U && bad==0;
+ }
+ 
++/* 1034: bounded synchronous 2D service. User buffers are CPU-only; the GPU
++ * can see only the private pinned DMA arena established at boot. No user
++ * supplied registers, IOVAs, physical addresses, or PM4. One job in flight.
++ * Publish ONLY after the 1033 hardware pixel + fence selftest passes. */
++extern "C" uint32_t whyred_a509_cp_status(void);
++uint32_t whyred_a509_cp_status(void)
++{
++    return __atomic_load_n(&wa509_cp_state,__ATOMIC_ACQUIRE);
++}
++static IOLock *wa509_service_lock;
++static vm_offset_t wa509_service_gpu, wa509_service_cb;
++static uint32_t wa509_service_wp, wa509_service_seq=0xa5090000U;
++static uint32_t wa509_service_clients;
++static bool wa509_service_dead;
++static constexpr uint32_t wa509_service_bytes=256U*1024U;
++
++/* Called with the service lock held, or by the initial boot selftest.
++ * 32-bit linear RGBA8. Pitch is the same for both buffers, in 64B units.
++ * All padding is initialized before execution; max 256x240 per request; 16 KiB tail guard.
++ * The ring is power-of-two and wraps only after the last job is idle. */
++static bool
++wa509_copy_geometry(uint64_t w,uint64_t h,uint64_t pitch)
++{
++    return w>0 && w<=256 && h>0 && h<=240 && pitch>=w*4 &&
++        pitch<=1024 && !(pitch&63) && pitch*h<=wa509_service_bytes-16384U;
++}
++static bool
++wa509_service_wait(vm_offset_t gpu,vm_offset_t cb,uint32_t wp,uint32_t seq)
++{
++    volatile uint32_t *f=(volatile uint32_t *)wa509_cp.fence.va;
++    uint64_t deadline;
++    clock_interval_to_deadline(250, NSEC_PER_MSEC, &deadline);
++    unsigned n=0;
++    for (;;) {
++        uint32_t fsr=wa509_cp_rd(cb,0x58),fault=wa509_cp_gr(gpu,0xb1a),
++            rp=wa509_cp_gr(gpu,0x806),status=wa509_cp_gr(gpu,0x4f5);
++        if (fsr || fault || rp==0xffffffffU || status==0xffffffffU) return false;
++        __asm__ volatile("dsb sy" ::: "memory");
++        if (rp==wp && !(status&(1U<<31)) && f[1]==seq) return true;
++        if (mach_absolute_time()>=deadline) return false;
++        if (++n<=40) IODelay(10); else IOSleep(1);
++    }
++}
++static bool
++wa509_service_copy(vm_offset_t gpu,vm_offset_t cb,uint32_t &wp,
++    uint32_t w,uint32_t h,uint32_t pitch,uint32_t seq)
++{
++    auto &s=wa509_cp;
++    if (!wa509_copy_geometry(w,h,pitch) || (uint64_t)pitch*h>s.src.size ||
++        (uint64_t)pitch*h>s.dst.size || !seq || s.ring.size!=32768 || wp>=8192 ||
++        wa509_cp_gr(gpu,0x806)!=wp || wa509_cp_gr(gpu,0x807)!=wp) return false;
++    uint32_t *rb=(uint32_t *)s.ring.va;
++    volatile uint32_t *f=(volatile uint32_t *)s.fence.va;
++    f[1]=0;
++    uint32_t p=wp;
++    auto emit=[&](uint32_t x){rb[p]=x;p=(p+1U)&8191U;};
++    auto reg=[&](uint32_t r,uint32_t x){emit(wa509_pkt4(r,1));emit(x);};
++    auto packet=[&](uint32_t op,uint32_t cnt){emit(whyred_a509_pkt7(op,cnt));};
++    // Invalidate old source cache entries before reusing the arena IOVA.
++    emit(wa509_pkt4(0x0e91,5));emit(0);emit(0);emit(0);emit(0);emit(0x12);
++    packet(0x26,0);
++    const uint32_t setup[][2]={{0xe141,8},{0x2100,0x86000000},{0x2180,0x86000000},{0x2184,9},
++        {0xe140,1U<<17},{0x0cc6,4},{0x0ec2,12},{0x0f02,0x344},{0x0e06,2},{0xe000,0x181}};
++    for (auto &pair:setup) reg(pair[0],pair[1]);
++    packet(0x6c,1);emit(5);
++    for (unsigned i=0;i<2;i++) {
++        uint64_t a=wa509_iova[4+i];
++        emit(wa509_pkt4(i?0x2110:0x2107,9));
++        emit(0x30);emit((uint32_t)a);emit((uint32_t)(a>>32));
++        emit((pitch>>6)|(((pitch*h)>>6)<<16));
++        for (unsigned j=0;j<5;j++) emit(0);
++        reg(i?0x2182:0x2181,0x30);
++    }
++    uint32_t rect=(w-1)|((h-1)<<16);
++    packet(0x2c,5);emit(1);emit(0);emit(rect);emit(0);emit(rect);
++    packet(0x6c,1);emit(8);packet(0x26,0);
++    uint64_t fence=wa509_iova[3]+4;
++    packet(0x46,4);emit(0x1d);emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(0);
++    packet(0x46,4);emit(4);emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(seq);
++    packet(0x26,0);
++    __asm__ volatile("dsb sy" ::: "memory");
++    wa509_cp_gw(gpu,0x0807,p);
++    if (!wa509_service_wait(gpu,cb,p,seq)) return false;
++    wp=p;
++    return true;
++}
++
++/* IOKit ABI v1: selector 0 -> four scalars [ABI, max_w, max_h, mapped_bytes].
++ * Selector 1: [width,height,pitch] -> [fence, hardware_elapsed_ns].
++ * Memory type 1 source, 2 destination; fixed client-local buffer handles.
++ * Admin only for bring-up. The API never returns DMA addresses. */
++class WhyredA509Service : public IOService {
++    OSDeclareDefaultStructors(WhyredA509Service);
++public:
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(WhyredA509Service, IOService);
++class WhyredA509UserClient : public IOUserClient {
++    OSDeclareDefaultStructors(WhyredA509UserClient);
++    IOBufferMemoryDescriptor *fSrc=nullptr, *fDst=nullptr;
++    bool fSlot=false, fClosed=false;
++public:
++    bool initWithTask(task_t task,void *securityID,UInt32 type,OSDictionary *properties) APPLE_KEXT_OVERRIDE;
++    bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++    void free(void) APPLE_KEXT_OVERRIDE;
++    IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++    IOReturn clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
++    IOReturn externalMethod(uint32_t selector,IOExternalMethodArguments *args,
++        IOExternalMethodDispatch *dispatch,OSObject *target,void *reference) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(WhyredA509UserClient, IOUserClient);
++bool WhyredA509Service::start(IOService *provider)
++{
++    if (!IOService::start(provider)) return false;
++    setProperty(kIOUserClientClassKey,"WhyredA509UserClient");
++    setName("WhyredA509Service");
++    registerService();
++    return true;
++}
++bool WhyredA509UserClient::initWithTask(task_t task,void *securityID,UInt32 type,OSDictionary *properties)
++{
++    fSrc=nullptr; fDst=nullptr; fSlot=false; fClosed=false;
++    if (type!=0 || !task || clientHasPrivilege(securityID,kIOClientPrivilegeAdministrator)!=kIOReturnSuccess) return false;
++    return IOUserClient::initWithTask(task,securityID,type,properties);
++}
++bool WhyredA509UserClient::start(IOService *provider)
++{
++    if (!wa509_service_lock || !IOUserClient::start(provider)) return false;
++    IOLockLock(wa509_service_lock);
++    if (wa509_service_dead || wa509_service_clients>=4) {IOLockUnlock(wa509_service_lock);return false;}
++    ++wa509_service_clients;fSlot=true;
++    IOLockUnlock(wa509_service_lock);
++    fSrc=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut|kIOMemoryKernelUserShared,wa509_service_bytes,PAGE_SIZE);
++    fDst=IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,kIODirectionInOut|kIOMemoryKernelUserShared,wa509_service_bytes,PAGE_SIZE);
++    if (!fSrc || !fDst || !fSrc->getBytesNoCopy() || !fDst->getBytesNoCopy()) return false;
++    bzero(fSrc->getBytesNoCopy(),wa509_service_bytes);bzero(fDst->getBytesNoCopy(),wa509_service_bytes);
++    return true;
++}
++void WhyredA509UserClient::free(void)
++{
++    if (fSlot) {IOLockLock(wa509_service_lock);--wa509_service_clients;fSlot=false;IOLockUnlock(wa509_service_lock);}
++    OSSafeReleaseNULL(fSrc);OSSafeReleaseNULL(fDst);
++    IOUserClient::free();
++}
++IOReturn WhyredA509UserClient::clientClose(void)
++{
++    if (wa509_service_lock) {IOLockLock(wa509_service_lock);fClosed=true;IOLockUnlock(wa509_service_lock);}
++    if (!isInactive()) terminate();
++    return kIOReturnSuccess;
++}
++IOReturn WhyredA509UserClient::clientMemoryForType(UInt32 type,IOOptionBits *options,IOMemoryDescriptor **memory)
++{
++    if (!options || !memory || !wa509_service_lock) return kIOReturnBadArgument;
++    IOLockLock(wa509_service_lock);
++    auto *b=(type==1?fSrc:type==2?fDst:nullptr);
++    IOReturn ret=kIOReturnBadArgument;
++    if (!fClosed && !wa509_service_dead && b) {b->retain();*memory=b;*options=0;ret=kIOReturnSuccess;}
++    IOLockUnlock(wa509_service_lock);
++    return ret;
++}
++IOReturn WhyredA509UserClient::externalMethod(uint32_t selector,IOExternalMethodArguments *args,
++    __unused IOExternalMethodDispatch *dispatch,__unused OSObject *target,__unused void *reference)
++{
++    if (!args || !wa509_service_lock || args->structureInputSize || args->structureOutputSize ||
++        args->structureInputDescriptor || args->structureOutputDescriptor || !args->scalarOutput) return kIOReturnBadArgument;
++    if (selector>1) return kIOReturnUnsupported;
++    if ((selector==0 && (args->scalarInputCount || args->scalarOutputCount!=4)) ||
++        (selector==1 && (!args->scalarInput || args->scalarInputCount!=3 || args->scalarOutputCount!=2))) return kIOReturnBadArgument;
++    IOLockLock(wa509_service_lock);
++    if (fClosed || wa509_service_dead || !fSrc || !fDst) {IOLockUnlock(wa509_service_lock);return kIOReturnNotReady;}
++    if (selector==0) {
++        args->scalarOutput[0]=1;args->scalarOutput[1]=256;args->scalarOutput[2]=240;args->scalarOutput[3]=wa509_service_bytes;
++        IOLockUnlock(wa509_service_lock);return kIOReturnSuccess;
++    }
++    const uint64_t w=args->scalarInput[0],h=args->scalarInput[1],pitch=args->scalarInput[2];
++    if (!wa509_copy_geometry(w,h,pitch)) {IOLockUnlock(wa509_service_lock);return kIOReturnBadArgument;}
++    const size_t bytes=(size_t)(h*pitch);
++    auto *src=(const uint8_t *)fSrc->getBytesNoCopy();auto *dst=(uint8_t *)fDst->getBytesNoCopy();
++    // Copy source into private DMA memory. Clear destination including padding.
++    memcpy(wa509_cp.src.va,src,bytes);
++    bzero(wa509_cp.src.va+bytes,wa509_service_bytes-bytes);
++    bzero(wa509_cp.dst.va,wa509_service_bytes);
++    uint32_t seq=++wa509_service_seq;if (!seq) seq=++wa509_service_seq;
++    uint64_t began=mach_absolute_time();
++    bool ok=wa509_service_copy(wa509_service_gpu,wa509_service_cb,wa509_service_wp,(uint32_t)w,(uint32_t)h,(uint32_t)pitch,seq);
++    uint64_t elapsed;absolutetime_to_nanoseconds(mach_absolute_time()-began,&elapsed);
++    if (!ok) {
++        // DMA memory is permanently pinned; never reuse it after a timeout.
++        wa509_service_dead=true;wa509_cp_mark(113);
++        IOLockUnlock(wa509_service_lock);return kIOReturnTimeout;
++    }
++    // Return actual GPU output only; zero destination padding (no stale bytes).
++    for (size_t y=0;y<h;y++) {memcpy(dst+y*pitch,wa509_cp.dst.va+y*pitch,w*4);bzero(dst+y*pitch+w*4,pitch-w*4);}
++    args->scalarOutput[0]=seq;args->scalarOutput[1]=elapsed;
++    IOLockUnlock(wa509_service_lock);return kIOReturnSuccess;
++}
++static void wa509_service_publish(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
++{
++    if (wa509_service_lock || wp>=8192) return;
++    wa509_service_lock=IOLockAlloc();if (!wa509_service_lock) return;
++    wa509_service_gpu=gpu;wa509_service_cb=cb;wa509_service_wp=wp;
++    IOService *provider=IOService::getPlatform();
++    WhyredA509Service *svc=OSTypeAlloc(WhyredA509Service);
++    if (!svc || !provider || !svc->init() || !svc->attach(provider)) {OSSafeReleaseNULL(svc);wa509_service_dead=true;return;}
++    if (!svc->start(provider)) {svc->detach(provider);wa509_service_dead=true;}
++    else {wa509_cp_mark(11);IOLog("A509: 2D_SERVICE_READY ABI=1 (admin-only)\n");}
++    svc->release();
++}
++
+ static void
+ whyred_a509_run_cp(void)
+ {
+     uint32_t enabled=0;
+-    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>3) return;
++    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>4) return;
+     if (__atomic_exchange_n(&wa509_cp_state,1,__ATOMIC_ACQ_REL)!=0) return;
+     auto &s=wa509_cp;
+     if (!whyred_a509_stage_fw("a530_pm4.fw",&s.pm4) || !whyred_a509_stage_fw("a530_pfp.fw",&s.pfp) ||
+         !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) ||
+-        (enabled==3 && (!whyred_a509_alloc(&s.src,PAGE_SIZE) || !whyred_a509_alloc(&s.dst,PAGE_SIZE))) || !wa509_cp_tables()) {
++        (enabled>=3 && (!whyred_a509_alloc(&s.src,enabled==4?wa509_service_bytes:PAGE_SIZE) ||
++            !whyred_a509_alloc(&s.dst,enabled==4?wa509_service_bytes:PAGE_SIZE))) || !wa509_cp_tables()) {
+         wa509_cp_mark(101); return;
+     }
+     wa509_cp_mark(2);
+@@ -1669,7 +1884,7 @@
+     IOLog("A509: hardware fence=%08x\n",fence);
+     if (fence!=0xc0ffee01) {wa509_cp_mark(109);return;}
+     wa509_cp_mark(6);
+-    if (enabled==3) {
++    if (enabled>=3) {
+         // A509-specific non-compressed blit prerequisites (HBB=14 live DT).
+         wa509_cp_gw(gpu,0x0e96,2);
+         wa509_cp_gw(gpu,0x0e81,1U<<29);
+@@ -1681,7 +1896,22 @@
+         wa509_cp_gw(gpu,0x0cc4,wa509_cp_gr(gpu,0x0cc4)|(1U<<9));
+         wa509_cp_gw(gpu,0x0e8f,1);
+         wa509_cp_mark(9);
+-        wa509_cp_mark(wa509_blit_test(gpu,cb,wp)?10:112);
++        if (!wa509_blit_test(gpu,cb,wp)) {wa509_cp_mark(112);return;}
++        wa509_cp_mark(10);
++        if (enabled==4) {
++            // Exercise repeated submissions and the larger arena before publishing.
++            uint32_t *src=(uint32_t *)s.src.va,*dst=(uint32_t *)s.dst.va;
++            for (unsigned pass=0;pass<3;pass++) {
++                for (unsigned i=0;i<61440;i++) {src[i]=wa509_pixel(i)^((pass+1U)<<8);dst[i]=~src[i];}
++                for (unsigned i=61440;i<65536;i++) {src[i]=0;dst[i]=0xdeadbeef;}
++                if (!wa509_service_copy(gpu,cb,wp,256,240,1024,++wa509_service_seq)) {wa509_cp_mark(114);return;}
++                unsigned bad=0;
++                for (unsigned i=0;i<61440;i++) if (((volatile uint32_t *)dst)[i]!=(wa509_pixel(i)^((pass+1U)<<8))) bad++;
++                for (unsigned i=61440;i<65536;i++) if (((volatile uint32_t *)dst)[i]!=0xdeadbeef) bad++;
++                if (bad) {IOLog("A509: SERVICE_PIXEL_MISMATCH=%u\n",bad);wa509_cp_mark(115);return;}
++            }
++            wa509_service_publish(gpu,cb,wp);
++        }
+     }
+     /* All buffers and mappings retained, even on failure. No arbitrary
+      * submissions exposed. Reset device before another test. */
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -483,6 +483,17 @@
+     return ok;
+ }
+ 
++extern uint32_t whyred_a509_cp_status(void);
++static int
++wa509_cp_status_sysctl SYSCTL_HANDLER_ARGS
++{
++    if (req->newptr) return EPERM;
++    uint32_t stage=whyred_a509_cp_status();
++    return SYSCTL_OUT(req,&stage,sizeof(stage));
++}
++SYSCTL_PROC(_kern, OID_AUTO, whyred_gpu_cp_state, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    NULL, 0, wa509_cp_status_sysctl, "I", "A509 command processor and service state");
++
+ static int
+ wa509_power_status SYSCTL_HANDLER_ARGS
+ {

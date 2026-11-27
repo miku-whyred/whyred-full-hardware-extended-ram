@@ -1,0 +1,29 @@
+name: a509-userspace
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'tools/whyred-a509-test/**'
+      - '.github/workflows/a509-userspace.yml'
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build iOS arm64 test
+        run: bash tools/whyred-a509-test/build.sh
+      - name: Check Mach-O and signature
+        run: |
+          cd tools/whyred-a509-test/out
+          file a509_test
+          lipo -archs a509_test | grep -x arm64
+          codesign --verify --verbose a509_test
+          shasum -a 256 a509_test > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: a509-ios-test
+          path: tools/whyred-a509-test/out/
+          if-no-files-found: error
