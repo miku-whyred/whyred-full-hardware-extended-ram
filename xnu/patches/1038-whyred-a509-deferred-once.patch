@@ -1,0 +1,65 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -2674,24 +2674,48 @@
+ extern "C" bool whyred_a509_clock_prepare(void);
+ extern "C" bool whyred_gpu_rails_ready(void);
+ 
++extern "C" void whyred_gpu_boot_probe(void);
++extern "C" int topaz_root_mounted(void);
++static uint32_t wa509_bringup_once;
++
+ /* Run outside topaz_adreno_init; give the modem RPM path and boot services
+  * time to settle. This does not disable USB, RAM, display or any driver. */
+ static void
+ whyred_a509_power_thread(__unused void *param, __unused wait_result_t wr)
+ {
++    IOLog("A509: DEFERRED_WORKER_ENTER\n");
++    /* Do not allocate wired DMA memory in the framebuffer start callback.
++     * Give BSD/VM and the root device time to finish initialisation. */
+     IOSleep(45000);
++    for (unsigned i=0; i<300 && !topaz_root_mounted(); ++i) IOSleep(1000);
++    if (!topaz_root_mounted()) {
++        IOLog("A509: DEFERRED_ROOT_TIMEOUT (no GPU MMIO or DMA)\n");
++        return;
++    }
++    IOLog("A509: DEFERRED_ROOT_READY\n");
++    whyred_gpu_boot_probe();
++    whyred_a509_buffer_probe();
++    IOLog("A509: DEFERRED_PROBES_DONE\n");
++    uint32_t on=0;
++    if (!PE_parse_boot_argn("whyred_gpu_power",&on,sizeof(on)) || on!=1) return;
+     for (unsigned i = 0; i < 120 && !whyred_gpu_rails_ready(); ++i) IOSleep(1000);
++    IOLog("A509: DEFERRED_POWER_BEGIN\n");
+     if (whyred_gpu_power_on() && whyred_a509_clock_prepare()) whyred_a509_run_cp();
++    IOLog("A509: DEFERRED_WORKER_DONE\n");
+ }
+ 
+ static void
+ whyred_a509_start_power(void)
+ {
+-    uint32_t on = 0;
+-    if (!PE_parse_boot_argn("whyred_gpu_power", &on, sizeof(on)) || on != 1) return;
++    if (__atomic_exchange_n(&wa509_bringup_once,1,__ATOMIC_ACQ_REL)!=0) return;
+     thread_t thread;
+-    if (kernel_thread_start(whyred_a509_power_thread, NULL, &thread) == KERN_SUCCESS)
++    if (kernel_thread_start(whyred_a509_power_thread, NULL, &thread) == KERN_SUCCESS) {
+         thread_deallocate(thread);
++        IOLog("A509: DEFERRED_WORKER_SCHEDULED\n");
++    } else {
++        __atomic_store_n(&wa509_bringup_once,0,__ATOMIC_RELEASE);
++        IOLog("A509: DEFERRED_WORKER_START_FAILED\n");
++    }
+ }
+ 
+ extern "C" void whyred_gpu_boot_probe(void);
+@@ -2702,8 +2726,7 @@
+ 	/* Whyred has A509, never run Topaz A610 MMIO/firmware sequences. */
+ 	uint32_t whyred_gpu = 0;
+ 	if (PE_parse_boot_argn("whyred_gpu", &whyred_gpu, sizeof(whyred_gpu)) && whyred_gpu != 0) {
+-		whyred_gpu_boot_probe();
+-		whyred_a509_buffer_probe();
++		/* No blocking allocations or GPU MMIO on the IOKit start path. */
+ 		whyred_a509_start_power();
+ 		return;
+ 	}
