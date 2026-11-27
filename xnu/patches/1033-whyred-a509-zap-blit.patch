@@ -1,0 +1,236 @@
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1326,11 +1326,11 @@
+  * Keep all DMA memory pinned for the session once hardware can reference it.
+  */
+ struct wa509_cp_storage {
+-    whyred_a509_buffer pm4, pfp, ring, fence, l1, l2, l3;
++    whyred_a509_buffer pm4, pfp, ring, fence, l1, l2, l3, src, dst;
+ };
+ static struct wa509_cp_storage wa509_cp;
+ static uint32_t wa509_cp_state;
+-static const uint64_t wa509_iova[4] = {0x40000000ULL,0x40040000ULL,0x40080000ULL,0x400c0000ULL};
++static const uint64_t wa509_iova[6] = {0x40000000ULL,0x40040000ULL,0x40080000ULL,0x400c0000ULL,0x40100000ULL,0x40140000ULL};
+ static uint32_t
+ wa509_cp_rd(vm_offset_t v, uint32_t o)
+ {
+@@ -1382,16 +1382,17 @@
+     uint64_t *a=(uint64_t *)s.l1.va, *b=(uint64_t *)s.l2.va, *c=(uint64_t *)s.l3.va;
+     a[1]=s.l2.pa|3ULL;
+     b[0]=s.l3.pa|3ULL;
+-    whyred_a509_buffer *bufs[]={&s.pm4,&s.pfp,&s.ring,&s.fence};
+-    for (unsigned i=0;i<4;i++) {
++    whyred_a509_buffer *bufs[]={&s.pm4,&s.pfp,&s.ring,&s.fence,&s.src,&s.dst};
++    for (unsigned i=0;i<6;i++) {
+         auto *buf=bufs[i];
++        if (i>=4 && !buf->size) continue;
+         if (!buf->size || buf->size>0x40000 || (buf->size&4095) || (buf->pa&4095)) return false;
+         unsigned slot=(unsigned)((wa509_iova[i]>>12)&511);
+         for (uint64_t off=0;off<buf->size;off+=4096) {
+             unsigned n=slot+(unsigned)(off>>12);
+             if (n>=512 || c[n]) return false;
+             c[n]=(buf->pa+off)|3ULL|(1ULL<<6)|(2ULL<<8)|(1ULL<<10)|
+-                 (3ULL<<53)|(i<2 ? (1ULL<<7):0);
++                 (3ULL<<53)|((i<2 || i==4) ? (1ULL<<7):0);
+         }
+     }
+     __asm__ volatile("dsb sy" ::: "memory");
+@@ -1489,15 +1490,126 @@
+     }
+     return false;
+ }
++/* Phase 7: authenticate the original signed a512_zap using the existing
++ * Qualcomm SCM implementation. Android's observed ZAP allocation was
++ * 0xfca00000..0xfca02000, within its excluded CMA pool (not XNU RAM).
++ * No forced PAS shutdown, no write to SECVID_TRUST_CNTL, no bypass of TZ.
++ * Only mode 2/3 uses PAS; mode 3 additionally tests a fixed 2D RGBA copy.
++ */
++static whyred_a509_buffer wa509_zap_meta;
++static uint32_t wa509_get32(const uint8_t *p) { uint32_t x; memcpy(&x,p,4); return x; }
++static uint16_t wa509_get16(const uint8_t *p) { uint16_t x; memcpy(&x,p,2); return x; }
++static bool
++wa509_zap_pas(void)
++{
++    const void *v[4]={}; size_t n[4]={};
++    const char *names[]={"a512_zap.mdt","a512_zap.b00","a512_zap.b01","a512_zap.b02"};
++    for (unsigned i=0;i<4;i++)
++        if (whyred_gpu_get_bootfw(names[i],&v[i],&n[i]) || !v[i] || !n[i]) return false;
++    const uint8_t *m=(const uint8_t *)v[0], *h=(const uint8_t *)v[2];
++    if (n[0]<148 || memcmp(m,"\177ELF\1\1",6) || wa509_get32(m+28)!=52 ||
++        wa509_get16(m+42)!=32 || wa509_get16(m+44)!=3 || n[1]!=148 || memcmp(m,v[1],148)) return false;
++    const uint8_t *p0=m+52,*p1=m+84,*p2=m+116;
++    uint32_t hlen=wa509_get32(p1+16), hoff=wa509_get32(p1+4),
++        files=wa509_get32(p2+16), mem=wa509_get32(p2+20), flags=wa509_get32(p2+24);
++    if (wa509_get32(p0)==1 || wa509_get32(p0+16)!=148 || ((wa509_get32(p1+24)>>24)&7)!=2 ||
++        hlen!=n[2] || hlen>PAGE_SIZE-148 || wa509_get32(p2)!=1 || ((flags>>24)&7)==2 ||
++        !(flags&(1U<<27)) || wa509_get32(p2+12)!=0x5000 || files!=n[3] || !files || files>mem ||
++        mem>0x2000 || ((mem+4095)&~4095U)!=0x2000) return false;
++    if (n[0]==148+hlen) { if (memcmp(m+148,h,hlen)) return false; }
++    else if (hoff<=n[0] && hlen<=n[0]-hoff) { if (memcmp(m+hoff,h,hlen)) return false; }
++    if (!whyred_a509_alloc(&wa509_zap_meta,148+hlen)) return false;
++    memcpy(wa509_zap_meta.va,m,148); memcpy(wa509_zap_meta.va+148,h,hlen);
++    __asm__ volatile("dsb sy" ::: "memory");
++    // Reserve and map only the recorded 16 KiB-aligned CMA subregion; it
++    // is never part of the main or extra XNU RAM ranges. Map before PAS.
++    const uint64_t base=0xfca00000ULL;
++    IOMemoryDescriptor *md=IOMemoryDescriptor::withPhysicalAddress(base,0x4000,kIODirectionInOut);
++    if (!md) return false;
++    IOMemoryMap *map=md->map(kIOMapWriteCombineCache); md->release();
++    if (!map) return false;
++    uint64_t res=0, st=scm(SCM_FN(SCM_SVC_PIL,PIL_INIT_IMAGE),2|(SCM_ARG_RW<<6),13,wa509_zap_meta.pa,0,&res);
++    IOLog("A509: ZAP_INIT ret=%llx res=%llx\n",(unsigned long long)st,(unsigned long long)res);
++    if (st || res) {map->release();return false;}
++    st=scm(SCM_FN(SCM_SVC_PIL,PIL_MEM_SETUP),3,13,base,0x2000,&res);
++    IOLog("A509: ZAP_MEM ret=%llx res=%llx\n",(unsigned long long)st,(unsigned long long)res);
++    if (st || res) {map->release();return false;}
++    volatile uint8_t *dst=(volatile uint8_t *)map->getVirtualAddress();
++    if (!dst) {map->release();return false;}
++    const uint8_t *seg=(const uint8_t *)v[3];
++    for (unsigned i=0;i<0x2000;i++) dst[i]=i<files?seg[i]:0;
++    __asm__ volatile("dsb sy" ::: "memory");
++    map->release(); // never access authenticated memory after TZ takes ownership
++    st=scm(SCM_FN(SCM_SVC_PIL,PIL_AUTH_RESET),1,13,0,0,&res);
++    IOLog("A509: ZAP_AUTH ret=%llx res=%llx\n",(unsigned long long)st,(unsigned long long)res);
++    return st==0 && res==0;
++}
++
++/* Fixed 32x32 RGBA8 -> RGBA8 copy; hardware register programming follows
++ * the public A5xx packet format and Mesa fd5_blitter.c. No arbitrary
++ * command stream, addresses, dimensions or register writes from userspace.
++ * Mesa source: https://chromium.googlesource.com/external/gitlab.freedesktop.org/mesa/mesa/+/41ddaf0ba41c54dddd1005afa5fe21b5d4e00ffb/src/gallium/drivers/freedreno/a5xx/fd5_blitter.c
++ */
++static uint32_t wa509_pkt4(uint32_t reg,uint32_t count)
++{
++    return 0x40000000U|count|(whyred_a509_odd(count)<<7)|(reg<<8)|(whyred_a509_odd(reg)<<27);
++}
++static uint32_t wa509_pixel(unsigned i) {return 0xff000000U|((i*37U)&255)|(((i*73U)&255)<<8)|(((i*109U)&255)<<16);}
++static bool
++wa509_blit_test(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
++{
++    auto &s=wa509_cp;
++    uint32_t *src=(uint32_t *)s.src.va,*dst=(uint32_t *)s.dst.va,*rb=(uint32_t *)s.ring.va;
++    if (!src || !dst || wp+128>=s.ring.size/4) return false;
++    for (unsigned i=0;i<1024;i++) {src[i]=wa509_pixel(i);dst[i]=~src[i];}
++    // Leave padding unchanged, catch a write outside the expected 4096 bytes.
++    for (uint64_t i=1024;i<s.dst.size/4;i++) dst[i]=0xdeadbeef;
++    volatile uint32_t *f=(volatile uint32_t *)s.fence.va;
++    f[1]=0;
++    auto emit=[&](uint32_t x){rb[wp++]=x;};
++    auto reg=[&](uint32_t r,uint32_t x){emit(wa509_pkt4(r,1));emit(x);};
++    auto packet=[&](uint32_t op,uint32_t cnt){emit(whyred_a509_pkt7(op,cnt));};
++    packet(0x26,0);
++    const uint32_t setup[][2]={{0xe141,8},{0x2100,0x86000000},{0x2180,0x86000000},{0x2184,9},
++        {0xe140,1U<<17},{0x0cc6,4},{0x0ec2,12},{0x0f02,0x344},{0x0e06,2},{0xe000,0x181}};
++    for (auto &p:setup) reg(p[0],p[1]);
++    packet(0x6c,1);emit(5); // BLIT2D
++    for (unsigned i=0;i<2;i++) {
++        uint64_t a=wa509_iova[4+i];
++        emit(wa509_pkt4(i?0x2110:0x2107,9));
++        emit(0x30);emit((uint32_t)a);emit((uint32_t)(a>>32));
++        emit(2U|(64U<<16)); // 128 byte pitch, 4096 byte array pitch
++        for (unsigned j=0;j<5;j++) emit(0);
++        reg(i?0x2182:0x2181,0x30);
++    }
++    packet(0x2c,5);emit(1);emit(0);emit(31U|(31U<<16));emit(0);emit(31U|(31U<<16));
++    packet(0x6c,1);emit(8); // END2D
++    packet(0x26,0);
++    uint64_t fence=wa509_iova[3]+4;
++    packet(0x46,4);emit(0x1d);emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(0);
++    packet(0x46,4);emit(4);emit((uint32_t)fence);emit((uint32_t)(fence>>32));emit(0xa509b117U);
++    packet(0x26,0);
++    __asm__ volatile("dsb sy" ::: "memory");
++    wa509_cp_gw(gpu,0x0807,wp);
++    if (!wa509_cp_wait(gpu,cb,wp)) return false;
++    __asm__ volatile("dsb sy" ::: "memory");
++    unsigned bad=0;
++    for (unsigned i=0;i<1024;i++) if (((volatile uint32_t *)dst)[i]!=wa509_pixel(i)) bad++;
++    for (uint64_t i=1024;i<s.dst.size/4;i++) if (((volatile uint32_t *)dst)[i]!=0xdeadbeef) bad++;
++    IOLog("A509: BLIT_RGBA32 fence=%08x mismatches=%u\n",f[1],bad);
++    return f[1]==0xa509b117U && bad==0;
++}
++
+ static void
+ whyred_a509_run_cp(void)
+ {
+     uint32_t enabled=0;
+-    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled!=1) return;
++    if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>3) return;
+     if (__atomic_exchange_n(&wa509_cp_state,1,__ATOMIC_ACQ_REL)!=0) return;
+     auto &s=wa509_cp;
+     if (!whyred_a509_stage_fw("a530_pm4.fw",&s.pm4) || !whyred_a509_stage_fw("a530_pfp.fw",&s.pfp) ||
+-        !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) || !wa509_cp_tables()) {
++        !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) ||
++        (enabled==3 && (!whyred_a509_alloc(&s.src,PAGE_SIZE) || !whyred_a509_alloc(&s.dst,PAGE_SIZE))) || !wa509_cp_tables()) {
+         wa509_cp_mark(101); return;
+     }
+     wa509_cp_mark(2);
+@@ -1505,9 +1617,10 @@
+     if (!gpu || !smmu) {wa509_cp_mark(102); return;}
+     /* No write to trust control, no CP_SET_SECURE_MODE without real PAS
+      * authentication. Normal execution may be possible only after ZAP. */
+-    uint32_t trust=wa509_cp_gr(gpu,0xf400);
+-    IOLog("A509: CP trust=%08x (no secure bypass)\n",trust);
+-    if (trust!=0) {wa509_cp_mark(103); return;}
++    if (enabled==1) {
++        uint32_t trust=wa509_cp_gr(gpu,0xf400);
++        if (trust!=0) {wa509_cp_mark(103); return;}
++    }
+     if (!wa509_cp_smmu(smmu,&cb)) {wa509_cp_mark(104); return;}
+     wa509_cp_mark(3);
+     if (wa509_cp_gr(gpu,0x806)!=0 || wa509_cp_gr(gpu,0x807)!=0 ||
+@@ -1516,8 +1629,7 @@
+     }
+     uint32_t *rb=(uint32_t *)s.ring.va;
+     whyred_a509_make_me_init(rb);
+-    rb[9]=whyred_a509_pkt7(0x3d,3);  /* CP_MEM_WRITE */
+-    rb[10]=(uint32_t)wa509_iova[3]; rb[11]=(uint32_t)(wa509_iova[3]>>32); rb[12]=0xc0ffee01;
++    /* Only ME_INIT is submitted initially; secure-mode switch follows PAS. */
+     __asm__ volatile("dsb sy" ::: "memory");
+     /* Mainline A509-specific thresholds, not A530 MERCIU value. Keep
+      * interrupts masked during this one-shot polling test. */
+@@ -1536,12 +1648,41 @@
+     wa509_cp_gw(gpu,0x0832,0); wa509_cp_gw(gpu,0x0807,9);
+     if (!wa509_cp_wait(gpu,cb,9)) {wa509_cp_mark(107);return;}
+     wa509_cp_mark(5);
+-    wa509_cp_gw(gpu,0x0807,13);
+-    if (!wa509_cp_wait(gpu,cb,13)) {wa509_cp_mark(108);return;}
++    uint32_t wp=9;
++    if (enabled>=2) {
++        if (!wa509_zap_pas()) {wa509_cp_mark(110);return;}
++        wa509_cp_mark(7);
++        rb[wp++]=whyred_a509_pkt7(0x66,1);rb[wp++]=0;
++        __asm__ volatile("dsb sy" ::: "memory");
++        wa509_cp_gw(gpu,0x0807,wp);
++        if (!wa509_cp_wait(gpu,cb,wp)) {wa509_cp_mark(111);return;}
++        wa509_cp_mark(8);
++    }
++    rb[wp++]=whyred_a509_pkt7(0x3d,3);
++    rb[wp++]=(uint32_t)wa509_iova[3];rb[wp++]=(uint32_t)(wa509_iova[3]>>32);rb[wp++]=0xc0ffee01;
++    rb[wp++]=whyred_a509_pkt7(0x26,0);
++    __asm__ volatile("dsb sy" ::: "memory");
++    wa509_cp_gw(gpu,0x0807,wp);
++    if (!wa509_cp_wait(gpu,cb,wp)) {wa509_cp_mark(108);return;}
+     __asm__ volatile("dsb sy" ::: "memory");
+     uint32_t fence=*(volatile uint32_t *)s.fence.va;
+     IOLog("A509: hardware fence=%08x\n",fence);
+-    wa509_cp_mark(fence==0xc0ffee01 ? 6 : 109);
++    if (fence!=0xc0ffee01) {wa509_cp_mark(109);return;}
++    wa509_cp_mark(6);
++    if (enabled==3) {
++        // A509-specific non-compressed blit prerequisites (HBB=14 live DT).
++        wa509_cp_gw(gpu,0x0e96,2);
++        wa509_cp_gw(gpu,0x0e81,1U<<29);
++        wa509_cp_gw64(gpu,0x0e87,0x0001ffffffff0000ULL);
++        wa509_cp_gw64(gpu,0x0e89,0x0001ffffffff0000ULL);
++        wa509_cp_gw64(gpu,0x0e8b,0x00100000ULL);
++        wa509_cp_gw64(gpu,0x0e8d,0x00100000ULL+0x44000-1);
++        wa509_cp_gw(gpu,0x0d00,(0x200U<<11)|(0x200U<<22));
++        wa509_cp_gw(gpu,0x0cc4,wa509_cp_gr(gpu,0x0cc4)|(1U<<9));
++        wa509_cp_gw(gpu,0x0e8f,1);
++        wa509_cp_mark(9);
++        wa509_cp_mark(wa509_blit_test(gpu,cb,wp)?10:112);
++    }
+     /* All buffers and mappings retained, even on failure. No arbitrary
+      * submissions exposed. Reset device before another test. */
+ }
