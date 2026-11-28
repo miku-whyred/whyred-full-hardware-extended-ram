@@ -1,0 +1,185 @@
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -132,6 +132,19 @@
+         delay(10);
+     }
+     return false;
++}
++
++/* A5xx may report the host interface busy while software reads these
++ * registers. Every other busy unit, and a pending hang, precludes idle. */
++bool whyred_a509_hw_idle(vm_offset_t gpu);
++bool
++whyred_a509_hw_idle(vm_offset_t gpu)
++{
++    const uint32_t status = wgpu_mmio_read(gpu, 0x04f5 * 4);
++    const uint32_t hi_busy = 1u;
++    const uint32_t hang_detect = 1u << 23;
++    return (status & ~hi_busy) == 0 &&
++        !(wgpu_mmio_read(gpu, 0x04e1 * 4) & hang_detect);
+ }
+ 
+ static bool
+@@ -551,13 +564,13 @@
+     vm_offset_t cc=wa509_dfs_cc,gpu=wa509_dfs_gpu;
+     {
+         uint32_t cx=wgpu_mmio_read(cc,WGPUCC_CX),gx=wgpu_mmio_read(cc,WGPUCC_GX),
+-            gate=wgpu_mmio_read(cc,WGPUCC_GFX3D),status=wgpu_mmio_read(gpu,0x4f5U*4),
++            gate=wgpu_mmio_read(cc,WGPUCC_GFX3D),
+             rp=wgpu_mmio_read(gpu,0x806U*4),wp=wgpu_mmio_read(gpu,0x807U*4),
+             pll=wgpu_mmio_read(cc,0x1000),cfg=wgpu_mmio_read(cc,WGPUCC_RCG+4),
+             root=wgpu_mmio_read(cc,WGPUCC_RCG);
+-        if(cx==0xffffffffU || gx==0xffffffffU || gate==0xffffffffU || status==0xffffffffU ||
++        if(cx==0xffffffffU || gx==0xffffffffU || gate==0xffffffffU ||
+             rp==0xffffffffU || wp==0xffffffffU || pll==0xffffffffU || cfg==0xffffffffU || root==0xffffffffU ||
+-            !(cx&WGPU_PWR_ON) || !(gx&WGPU_PWR_ON) || (gate&WGATE_OFF) || (status&(1U<<31)) || rp!=wp ||
++            !(cx&WGPU_PWR_ON) || !(gx&WGPU_PWR_ON) || (gate&WGATE_OFF) || !whyred_a509_hw_idle(gpu) || rp!=wp ||
+             (pll&0x80000007U)!=0x80000007U || (root&0x80000001U) || (cfg&0x371fU)!=(old==2?0x103U:1U)){
+             ok=false;goto stop;
+         }
+@@ -607,7 +620,7 @@
+         (wgpu_mmio_read(cc,WGPUCC_GFX3D)&WGATE_OFF)) goto done;
+     gpu=ml_io_map(WGPU_MMIO,0x40000);
+     if (!gpu || wgpu_mmio_read(gpu,0x806U*4) || wgpu_mmio_read(gpu,0x807U*4) ||
+-        (wgpu_mmio_read(gpu,0x4f5U*4)&(1U<<31))) goto done;
++        !whyred_a509_hw_idle(gpu)) goto done;
+     old_root=wgpu_mmio_read(cc,WGPUCC_RCG+4);
+     if ((old_root&0x371fU)!=1U || (wgpu_mmio_read(cc,WGPUCC_RCG)&0x80000001U)) goto done;
+     old_mode=wgpu_mmio_read(cc,pll);old_l=wgpu_mmio_read(cc,pll+4);old_a=wgpu_mmio_read(cc,pll+8);
+diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
+--- a/iokit/Kernel/arm/TopazAdreno.cpp
++++ b/iokit/Kernel/arm/TopazAdreno.cpp
+@@ -1482,6 +1482,8 @@
+     *cb_out=cb;
+     return true;
+ }
++extern "C" bool whyred_a509_hw_idle(vm_offset_t gpu);
++
+ static bool
+ wa509_cp_wait(vm_offset_t gpu,vm_offset_t cb,uint32_t wp)
+ {
+@@ -1491,8 +1493,7 @@
+             IOLog("A509: CP fault FSR=%08x HW=%08x RP=%08x\n",fsr,fault,rp);
+             return false;
+         }
+-        uint32_t status=wa509_cp_gr(gpu,0x4f5);
+-        if (rp==wp && status!=0xffffffffU && !(status&(1U<<31))) return true;
++        if (rp == wp && whyred_a509_hw_idle(gpu)) return true;
+         IODelay(100);
+     }
+     return false;
+@@ -1642,10 +1643,10 @@
+     unsigned n=0;
+     for (;;) {
+         uint32_t fsr=wa509_cp_rd(cb,0x58),fault=wa509_cp_gr(gpu,0xb1a),
+-            rp=wa509_cp_gr(gpu,0x806),status=wa509_cp_gr(gpu,0x4f5);
+-        if (fsr || fault || rp==0xffffffffU || status==0xffffffffU) return false;
++            rp=wa509_cp_gr(gpu,0x806);
++        if (fsr || fault || rp==0xffffffffU) return false;
+         __asm__ volatile("dsb sy" ::: "memory");
+-        if (rp==wp && !(status&(1U<<31)) && f[1]==seq) return true;
++        if (rp==wp && f[1]==seq && whyred_a509_hw_idle(gpu)) return true;
+         if (mach_absolute_time()>=deadline) return false;
+         if (++n<=40) IODelay(10); else IOSleep(1);
+     }
+@@ -2029,10 +2030,10 @@
+     for (unsigned n=0;;n++) {
+         uint32_t observed=__atomic_load_n(&wa509_irq_count,__ATOMIC_ACQUIRE);
+         uint32_t fsr=wa509_cp_rd(cb,0x58),fault=wa509_cp_gr(gpu,0xb1a),
+-            rp=wa509_cp_gr(gpu,0x806),status=wa509_cp_gr(gpu,0x4f5);
+-        if (fsr || fault || rp==0xffffffffU || status==0xffffffffU) return false;
++            rp=wa509_cp_gr(gpu,0x806);
++        if (fsr || fault || rp==0xffffffffU) return false;
+         __asm__ volatile("dsb sy" ::: "memory");
+-        if (rp==p && !(status&(1U<<31)) && f[1]==seq) {
++        if (rp==p && f[1]==seq && whyred_a509_hw_idle(gpu)) {
+             wp=p;__atomic_store_n(&wa509_last_activity,mach_absolute_time(),__ATOMIC_RELAXED);return true;
+         }
+         if (mach_absolute_time()>=deadline) return false;
+@@ -2280,6 +2281,37 @@
+     uint64_t bytes=(uint64_t)l.sp*l.h;
+     return bytes<=wa509_direct_bytes && bytes<=l.md->getLength()-l.off;
+ }
++/* Up to four validated opaque rectangles. The union of covered x intervals
++ * changes only at a layer's top or bottom edge. Never scan old back-buffer
++ * pixels through a gap in the new frame. */
++static bool
++wa509_layers_cover(const wa509_layer *layers, unsigned n, uint32_t width, uint32_t height)
++{
++    for (uint32_t y = 0; y < height; ) {
++        uint32_t next_y = height;
++        for (unsigned i = 0; i < n; ++i) {
++            const auto &layer = layers[i];
++            if (layer.dy > y && layer.dy < next_y) next_y = layer.dy;
++            const uint32_t bottom = layer.dy + layer.h;
++            if (bottom > y && bottom < next_y) next_y = bottom;
++        }
++        for (uint32_t x = 0; x < width; ) {
++            uint32_t right = x;
++            for (unsigned i = 0; i < n; ++i) {
++                const auto &layer = layers[i];
++                if (layer.dy <= y && y < layer.dy + layer.h && layer.dx <= x &&
++                    layer.dx + layer.w > right) {
++                    right = layer.dx + layer.w;
++                }
++            }
++            if (right == x) return false;
++            x = right;
++        }
++        y = next_y;
++    }
++    return true;
++}
++
+ extern "C" const uint8_t *whyred_a509_scanout_view(uint64_t pa);
+ const uint8_t *whyred_a509_scanout_view(uint64_t pa)
+ {
+@@ -2301,12 +2333,23 @@
+ extern "C" bool whyred_a509_compose(const wa509_layer *,unsigned,uint32_t,uint32_t,uint32_t,uint64_t,uint64_t *);
+ bool whyred_a509_compose(const wa509_layer *layers,unsigned n,uint32_t w,uint32_t h,uint32_t dp,uint64_t current,uint64_t *out)
+ {
+-    // Require a full first layer. Partial frames would need preserved front
+-    // contents, which may belong to the CPU fallback and are not mapped here.
+     if (!layers || !out || n<2 || n>4 || !wa509_direct_geometry(w,h,dp) ||
+-        layers[0].dx || layers[0].dy || layers[0].w!=w || layers[0].h!=h ||
+         !__atomic_load_n(&wa509_display_ready,__ATOMIC_ACQUIRE) || !wa509_hw_lock || !wa509_direct_lock) return false;
+-    for(unsigned i=0;i<n;i++) if(!wa509_layer_valid(layers[i],w,h,dp)) return false;
++    for (unsigned i = 0; i < n; ++i) {
++        if (!wa509_layer_valid(layers[i], w, h, dp)) return false;
++    }
++    // A later full opaque layer supersedes all earlier copies.
++    unsigned first = 0;
++    bool full = false;
++    for (unsigned i = 0; i < n; ++i) {
++        if (layers[i].w == w && layers[i].h == h) {
++            first = i;
++            full = true;
++        }
++    }
++    layers += first;
++    n -= first;
++    if (!full && !wa509_layers_cover(layers, n, w, h)) return false;
+     if(!IOLockTryLock(wa509_hw_lock)){__atomic_add_fetch(&wa509_compose_skip,1,__ATOMIC_RELAXED);return false;}
+     uint64_t start=mach_absolute_time(),deadline;
+     clock_interval_to_deadline(12,NSEC_PER_MSEC,&deadline);
+@@ -2561,7 +2604,9 @@
+ {
+     uint32_t enabled=0;
+     if (!PE_parse_boot_argn("whyred_gpu_cp",&enabled,sizeof(enabled)) || enabled<1 || enabled>5) return;
+-    if (__atomic_exchange_n(&wa509_cp_state,1,__ATOMIC_ACQ_REL)!=0) return;
++    uint32_t expected = 0;
++    if (!__atomic_compare_exchange_n(&wa509_cp_state, &expected, 1, false,
++            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) return;
+     auto &s=wa509_cp;
+     if (!whyred_a509_stage_fw("a530_pm4.fw",&s.pm4) || !whyred_a509_stage_fw("a530_pfp.fw",&s.pfp) ||
+         !whyred_a509_alloc(&s.ring,32768) || !whyred_a509_alloc(&s.fence,PAGE_SIZE) ||
+@@ -2583,7 +2628,7 @@
+     if (!wa509_cp_smmu(smmu,&cb)) {wa509_cp_mark(104); return;}
+     wa509_cp_mark(3);
+     if (wa509_cp_gr(gpu,0x806)!=0 || wa509_cp_gr(gpu,0x807)!=0 ||
+-        wa509_cp_gr(gpu,0x4f5)==0xffffffffU || (wa509_cp_gr(gpu,0x4f5)&(1U<<31))) {
++        !whyred_a509_hw_idle(gpu)) {
+         wa509_cp_mark(105); return;
+     }
+     uint32_t *rb=(uint32_t *)s.ring.va;

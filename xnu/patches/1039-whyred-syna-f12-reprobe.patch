@@ -1,0 +1,176 @@
+diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
+--- a/bsd/dev/sweet_syna.c
++++ b/bsd/dev/sweet_syna.c
+@@ -85,6 +85,7 @@
+ static vm_offset_t gcc, qup, tlmm_s, tlmm_n_66, tlmm_n_67;
+ static unsigned in_fifo, out_fifo;
+ static int syna_mode, syna_chan;
++static uint32_t syna_started;
+ static uint32_t maxx = 1080, maxy = 2160, flip;
+ 
+ static inline uint32_t rd(vm_offset_t b, uint32_t o) { uint32_t v = *(volatile uint32_t *)(b + o); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
+@@ -333,6 +334,8 @@
+ static bool
+ rmi_scan(void)
+ {
++	bzero(&f01, sizeof(f01));
++	bzero(&f12, sizeof(f12));
+ 	uint8_t page0 = 0;
+ 	int e = rmi_write(0xff, &page0, 1);
+ 	if (e) {
+@@ -361,8 +364,8 @@
+ 	return f01.num == 0x01 && f12.num == 0x12;
+ }
+ 
+-static void
+-rmi_info(void)
++static bool
++rmi_configure(uint16_t *object_reg)
+ {
+ 	uint8_t q[21] = {0}, st = 0, ctl = 0, f12q[8] = {0};
+ 	if (!rmi_read(f01.query, q, sizeof(q))) {
+@@ -373,18 +376,32 @@
+ 		id[10] = 0;
+ 		printf("WHYRED TOUCH: F01 manufacturer %u product \"%s\"\n", q[0], id);
+ 	}
+-	(void)rmi_read(f01.data, &st, 1);
+-	(void)rmi_read(f01.control, &ctl, 1);
++	if (rmi_read(f01.data, &st, 1) || (st & 0x40u) || rmi_read(f01.control, &ctl, 1)) {
++		return false;
++	}
+ 	printf("WHYRED TOUCH: F01 status %#x (code %u%s%s) ctrl0 %#x\n", st, st & 0xfu,
+ 	    (st & 0x40u) ? ", bootloader" : "", (st & 0x80u) ? ", unconfigured" : "", ctl);
+-	if (st & 0x80u) {
+-		uint8_t c = (uint8_t)(ctl | 0x80u);     /* configured, as rmi_f01 does after reset */
+-		(void)rmi_write(f01.control, &c, 1);
++	/* F01 control 0: configured, normal operation. Preserve the other controls. */
++	uint8_t awake = (uint8_t)((ctl & ~3u) | 0x80u);
++	if (((st & 0x80u) || awake != ctl) && rmi_write(f01.control, &awake, 1)) {
++		return false;
++	}
++	uint8_t query_size = 0, presence[2];
++	if (f12.query > 0xf5 || rmi_read(f12.query + 7, &query_size, 1) ||
++	    query_size < sizeof(presence) || rmi_read(f12.query + 8, presence, sizeof(presence)) ||
++	    !(presence[1] & 2u)) {
++		return false;
++	}
++	/* Query 8 has a size byte followed by Data0..7 presence bits. */
++	*object_reg = f12.data + (presence[1] & 1u);
++	if (*object_reg >= 0xff) {
++		return false;
+ 	}
+ 	if (!rmi_read(f12.query, f12q, sizeof(f12q))) {
+ 		printf("WHYRED TOUCH: F12 query %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 		    f12q[0], f12q[1], f12q[2], f12q[3], f12q[4], f12q[5], f12q[6], f12q[7]);
+ 	}
++	return true;
+ }
+ 
+ static void
+@@ -445,41 +462,60 @@
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_touch, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     whyred_touch_sysctl, "Q", "inject a one-finger touch: x1 | y1<<12 | x2<<24 | y2<<36 | ms<<48");
+ 
+-static void
+-syna_thread(__unused void *arg, __unused wait_result_t wr_)
+-{
+-	sleep_ms(20000);        /* after the UDP log and SpringBoard are up */
++static unsigned
++syna_discover(uint16_t *object_reg)
++{
+ 	if (!clocks_on()) {
+-		return;
++		return 0;
+ 	}
+ 	pins();
+ 	uint32_t io = rd(qup, QUP_IO_MODE);
++	if (io == 0xffffffffu) {
++		return 0;
++	}
+ 	static const unsigned blk[4] = { 4, 16, 32, 4 };
+ 	out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
+ 	in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
+-	printf("WHYRED TOUCH: QUP hw %#x io_mode %#x (fifo out %u in %u) state %#x\n",
+-	    rd(qup, QUP_HW_VERSION), io, out_fifo, in_fifo, rd(qup, QUP_STATE));
+-	if (!rmi_scan()) {
+-		printf("WHYRED TOUCH: F01/F12 not found\n");
+-		return;
+-	}
+-	rmi_info();
+-
+-	unsigned nobj = (in_fifo - 2) / 8;
+-	nobj = nobj > SYNA_MAX_OBJ ? SYNA_MAX_OBJ : nobj;
+-	printf("WHYRED TOUCH: polling F12 data %#x, %u objects, mode %d, range %ux%u flip %#x\n",
+-	    f12.data, nobj, syna_mode, maxx, maxy, flip);
++	if (in_fifo < 10 || out_fifo < 6 || !rmi_scan() || !rmi_configure(object_reg)) {
++		return 0;
++	}
++	unsigned count = (in_fifo - 2) / 8;
++	return count > SYNA_MAX_OBJ ? SYNA_MAX_OBJ : count;
++}
++
++static void
++syna_thread(__unused void *arg, __unused wait_result_t wr_)
++{
++	sleep_ms(20000);
++	uint16_t object_reg = 0;
++	unsigned nobj = 0, errors = 0, retry_ms = 250;
+ 	uint8_t prev[SYNA_MAX_OBJ * 8] = {0}, d[SYNA_MAX_OBJ * 8];
+-	unsigned errors = 0;
+ 	for (;;) {
+-		int e = rmi_read(f12.data, d, nobj * 8);
++		if (!nobj) {
++			nobj = syna_discover(&object_reg);
++			if (!nobj) {
++				sleep_ms(retry_ms);
++				retry_ms = MIN(2 * retry_ms, 30000u);
++				continue;
++			}
++			retry_ms = 250;
++			printf("WHYRED TOUCH: polling F12 data %#x, %u objects, mode %d\n",
++			    object_reg, nobj, syna_mode);
++		}
++		int e = rmi_read(object_reg, d, nobj * 8);
+ 		if (e) {
+-			if ((errors++ % 500u) == 0) {
+-				printf("WHYRED TOUCH: F12 read error %d\n", e);
++			if (++errors == 5) {
++				printf("WHYRED TOUCH: F12 read error %d, rediscovering\n", e);
++				if (syna_mode == 2) {
++					report(0, NULL, NULL);
++				}
++				bzero(prev, sizeof(prev));
++				nobj = errors = 0;
+ 			}
+ 			sleep_ms(50);
+ 			continue;
+ 		}
++		errors = 0;
+ 		if (inj_req != 0) {
+ 			uint64_t r = inj_req;
+ 			inj_req = 0;
+@@ -545,6 +581,9 @@
+ 	if (mode == 0 || maxx == 0 || maxy == 0) {
+ 		return;
+ 	}
++	if (__atomic_exchange_n(&syna_started, 1, __ATOMIC_ACQ_REL)) {
++		return;
++	}
+ 	syna_mode = mode;
+ 	gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	qup = ml_io_map(QUP_PA, 0x1000);
+@@ -553,11 +592,14 @@
+ 	tlmm_n_67 = ml_io_map(TLMM_NORTH + 0x1000u * 67, 0x1000);
+ 	if (!gcc || !qup || !tlmm_s || !tlmm_n_66 || !tlmm_n_67) {
+ 		printf("WHYRED TOUCH: MMIO mapping failed\n");
++		__atomic_store_n(&syna_started, 0, __ATOMIC_RELEASE);
+ 		return;
+ 	}
+ 	thread_t t;
+ 	if (kernel_thread_start(syna_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
++	} else {
++		__atomic_store_n(&syna_started, 0, __ATOMIC_RELEASE);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

@@ -19,7 +19,7 @@ on:
         description: runner label (macos-15 = arm64, macos-15-intel when arm64 capacity is short)
         default: macos-15
   push:
-    branches: [main]
+    branches: [main, "whyred/**"]
     paths:
       - "xnu/patches/**"
       - ".github/workflows/xnu.yml"
