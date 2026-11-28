@@ -1,0 +1,166 @@
+diff --git a/bsd/sys/mount_internal.h b/bsd/sys/mount_internal.h
+--- a/bsd/sys/mount_internal.h
++++ b/bsd/sys/mount_internal.h
+@@ -483,6 +483,7 @@
+ #define KERNEL_MOUNT_BASESYSTEMROOT     0x80 /* mount a base root volume "instead of" the full root volume (only used during bsd_init) */
+ #define KERNEL_MOUNT_DEVFS             0x100 /* kernel startup mount of devfs */
+ #define KERNEL_MOUNT_FMOUNT            0x200 /* is fmount() system call */
++#define KERNEL_MOUNT_WHYRED_GRAPHICS   0x800 /* built-in, read-only graphics disk during bsd_init */
+ #define KERNEL_MOUNT_KMOUNT            0x400 /* is kernel_mount() call */
+ 
+ /* mask for checking if any of the "mount volume by role" flags are set */
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -1173,7 +1173,7 @@
+ 	 */
+ 	if (kernelmount && (vfsp->vfc_vfsflags & VFC_VFSLOCALARGS) &&
+ 	    ((internal_flags & KERNEL_MOUNT_VOLBYROLE_MASK) == 0) &&
+-	    ((internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) == 0)) {
++	    ((internal_flags & (KERNEL_MOUNT_BASESYSTEMROOT | KERNEL_MOUNT_WHYRED_GRAPHICS)) == 0)) {
+ 		error = EINVAL;  /* unsupported request */
+ 		goto out1;
+ 	}
+@@ -1329,6 +1329,16 @@
+ 		}
+ #endif // CONFIG_BASESYSTEMROOT
+ 
++		if (kernelmount && (internal_flags & KERNEL_MOUNT_WHYRED_GRAPHICS)) {
++			if (strcmp(fstypename, "hfs") != 0 || !(mp->mnt_flag & MNT_RDONLY)) {
++				error = EINVAL;
++				goto out1;
++			}
++			devpath = CAST_USER_ADDR_T("/dev/wgl/media");
++			do_copyin_devpath = false;
++			fsmountargs = USER_ADDR_NULL;
++		}
++
+ 		if (do_copyin_devpath) {
+ 			if (vfs_context_is64bit(ctx)) {
+ 				if ((error = copyin(fsmountargs, (caddr_t)&devpath, sizeof(devpath)))) {
+@@ -1350,12 +1360,7 @@
+ 		if ((devpath)) {
+ 			struct nameidata nd;
+ 
+-			enum uio_seg seg = UIO_USERSPACE;
+-#if CONFIG_BASESYSTEMROOT
+-			if (internal_flags & KERNEL_MOUNT_BASESYSTEMROOT) {
+-				seg = UIO_SYSSPACE;
+-			}
+-#endif // CONFIG_BASESYSTEMROOT
++			enum uio_seg seg = do_copyin_devpath ? UIO_USERSPACE : UIO_SYSSPACE;
+ 
+ 			NDINIT(&nd, LOOKUP, OP_MOUNT, FOLLOW, seg, devpath, ctx);
+ 			if ((error = namei(&nd))) {
+diff --git a/bsd/sweet_hfs/core/hfs_vfsops.c b/bsd/sweet_hfs/core/hfs_vfsops.c
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -483,7 +483,13 @@
+ 		/* Set the mount flag to indicate that we support volfs  */
+ 		vfs_setflags(mp, (u_int64_t)((unsigned int)MNT_DOVOLFS));
+ 
+-		retval = hfs_mountfs(devvp, mp, data ? &args : NULL, 0, context);
++		bool graphics = !data && vfs_isrdonly(mp) &&
++		    !strcmp(vfs_statfs(mp)->f_mntfromname, "/dev/wgl/media");
++		if (graphics) {
++			bzero(&args, sizeof(args));
++			args.hfs_mask = 0555;
++		}
++		retval = hfs_mountfs(devvp, mp, (data || graphics) ? &args : NULL, 0, context);
+ 		if (retval) { 
+ 			const char *name = vnode_getname(devvp);
+ 			printf("hfs_mount: hfs_mountfs returned error=%d for device %s\n", retval, (name ? name : "unknown-dev"));
+@@ -500,7 +506,7 @@
+ 		hfsmp->hfs_defrag_max = HFS_INITIAL_DEFRAG_SIZE;
+ 
+ 
+-		if (!data) {
++		if (!data && !graphics) {
+ 			// Root mount
+ 
+ 			hfsmp->hfs_uid = UNKNOWNUID;
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -60,6 +60,7 @@
+ #define ROOTDEVICETIMEOUT       60
+ #endif
+ 
++extern void whyred_graphics_memdev(dev_t device);
+ extern dev_t mdevadd(int devid, uint64_t base, unsigned int size, int phys);
+ extern dev_t mdevlookup(int devid);
+ extern void mdevremoveall(void);
+@@ -760,7 +761,15 @@
+ 					panic("ramdisk params");
+ 				}
+ #endif /* __LP64__ */
+-				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
++				dev_t memoryDevice = mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++				int graphics = 0;
++				if (PE_parse_boot_argn("wgl", &graphics, sizeof(graphics)) && graphics == 1) {
++					whyred_graphics_memdev(memoryDevice);
++				}
++#else
++				(void)memoryDevice;
++#endif        /* Initialize it and pass back the device number */
+ 			}
+ 			regEntry->release();                                                            /* Toss the entry */
+ 		}
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -146,6 +146,7 @@
+ #include <kern/sched_prim.h>            /* for thread_wakeup() */
+ #include <net/if_ether.h>               /* for ether_family_init() */
+ #include <net/if_gif.h>                 /* for gif_init() */
++#include <miscfs/devfs/devfs.h>
+ #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
+ #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
+ #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
+@@ -473,6 +474,17 @@
+  * of the tro_ucred field so that the uthread structure can be
+  * used like any other.
+  */
++#if DEVFS && defined(ARM64_BOARD_CONFIG_SWEET)
++/* The RAMDisk is a second device. The root stays on eMMC. No directory is created on userdata. */
++static dev_t whyred_graphics_device = NODEV;
++void whyred_graphics_memdev(dev_t device);
++void
++whyred_graphics_memdev(dev_t device)
++{
++	whyred_graphics_device = device;
++}
++#endif
++
+ void
+ bsd_init(void)
+ {
+@@ -999,6 +1011,15 @@
+ 
+ 		bsd_init_kprintf("calling devfs_kernel_mount\n");
+ 		devfs_kernel_mount(mounthere);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		if (whyred_graphics_device != NODEV) {
++			void *media = devfs_make_node(whyred_graphics_device, DEVFS_BLOCK, 0, 0, 0400, "wgl/media");
++			int error = media == NULL ? ENXIO : kernel_mount("hfs", NULLVP, NULLVP, "/dev/wgl",
++			    NULL, 0, MNT_RDONLY | MNT_NODEV | MNT_NOSUID | MNT_DONTBROWSE,
++			    KERNEL_MOUNT_WHYRED_GRAPHICS | KERNEL_MOUNT_NOAUTH, vfs_context_kernel());
++			printf("WHYRED GPU: graphics disk at /dev/wgl: %d\n", error);
++		}
++#endif
+ 	}
+ #endif /* DEVFS */
+ 
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -479,7 +479,7 @@
+ 		return false;
+ 	}
+ 	const char *const paths[] = {
+-		"/usr/libexec/backboardd", "/usr/libexec/real/backboardd", "/topaz/backboardd", "/var/root/gltest"
++		"/usr/libexec/backboardd", "/usr/libexec/real/backboardd", "/topaz/backboardd", "/dev/wgl/gltest"
+ 	};
+ 	bool allow = false;
+ 	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {

@@ -23,6 +23,7 @@ on:
     paths:
       - "xnu/patches/**"
       - "xnu/whyred-fd509/**"
+      - "whyred/tools/mkgraphics-macos.sh"
       - ".github/workflows/xnu.yml"
 
 
@@ -159,16 +160,6 @@ jobs:
           done
           ls -la out/kdk-libs
 
-      - name: Build matching whyred UI bridge
-        if: matrix.flavor == 'fd509'
-        run: |
-          mkdir -p out
-          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -ffreestanding -fno-stack-protector \
-            -fvisibility=hidden -dynamiclib -install_name /usr/lib/whyred_ui.dylib upstream/whyred/userland/whyred_ui.c \
-            -framework IOKit -framework CoreFoundation -framework AudioToolbox -lobjc -o out/whyred_ui.dylib
-          codesign -f -s - out/whyred_ui.dylib
-          (cd out && shasum -a 256 whyred_ui.dylib > WHYRED_UI_SHA256SUMS)
-
       - name: Collect
         if: always()
         run: |
@@ -183,3 +174,27 @@ jobs:
           name: xnu-kernel${{ matrix.suffix }}
           path: out/
           if-no-files-found: warn
+
+  graphics:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: m-obeid/ios-whyred
+          ref: 9b18976b9022fd244eda02071a342a3621b7862b
+          path: upstream
+          persist-credentials: false
+      - name: Package FD509 userspace in a read-only HFS+ disk
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash whyred/tools/mkgraphics-macos.sh upstream graphics
+      - uses: actions/upload-artifact@v4
+        with:
+          name: whyred-graphics
+          path: graphics/
+          if-no-files-found: error
