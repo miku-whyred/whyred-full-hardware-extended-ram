@@ -1,3 +1,22 @@
+# Redmi Note 5 (whyred) • XNU / iOS 16
+
+The `--ios` profile targets a whyred with an unlocked bootloader, the 3 GB memory layout, and the existing iOS 16.7.16 (20H392) HFS+ root on `userdata`. It boots the eMMC root with a native 1080 × 2160 canvas, Synaptics input delivered to iOS, and the Adreno 509 display path enabled. Booting the image leaves the contents of the boot partition intact. iOS mounts its existing root read/write.
+
+On Linux, install Python 3, `lzfse` (command or Python module), AArch64 GNU GCC/binutils and AOSP `mkbootimg`. With a kernel from this branch, run
+
+```sh
+bash whyred/mkboot.sh --ios /path/to/kernel.development.sweet
+fastboot boot whyred/out/whyred-ios16-a509.img
+```
+
+The alternative `bash whyred/mkboot.sh --ios --run RUN_ID` downloads the development kernel using an authenticated GitHub CLI. The first image build fetches the device-tree member of the Apple IPSW and the six GPU firmware files. Subsequent builds reuse inputs verified by SHA-256. The original diagnostic RAM-disk build is available with `whyred/mkboot.sh KERNEL`.
+
+The A509 path copies eligible BGRA surfaces and composites opaque rectangles once hardware bring-up and pixel tests pass. On the running phone, `sysctl kern.whyred_gpu_cp_state kern.whyred_gpu_display_state kern.whyred_gpu_compose_state` shows the command processor stage and completed GPU operations. General-purpose OpenGL ES, Metal, camera capture and other subsystems still need work or device validation. The prepared root supplies the iOS services and any installed audio plug-ins.
+
+## Upstream topaz notes
+
+The original README below describes the Redmi Note 12 4G and its Adreno 610. For device-specific observations on whyred, see [the hardware bring-up log](whyred/research/recon/whyred-facts.md).
+
 # ios-topaz
 
 **Apple's iOS 16 running on a Redmi Note 12 4G.**

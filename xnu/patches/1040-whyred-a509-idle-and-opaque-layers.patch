@@ -183,3 +183,24 @@ diff --git a/iokit/Kernel/arm/TopazAdreno.cpp b/iokit/Kernel/arm/TopazAdreno.cpp
          wa509_cp_mark(105); return;
      }
      uint32_t *rb=(uint32_t *)s.ring.va;
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1431,8 +1431,15 @@
+             get32(b,0)==0 && get32(b,4)==0 && get32(b,8)==fLogicalW && get32(b,12)==fLogicalH;
+         bool panel=s->width==fWidth && s->height==fHeight && get32(b,0)==(uint32_t)fOffX &&
+             get32(b,4)==(uint32_t)fOffY && get32(b,8)==fWidth && get32(b,12)==fHeight;
+-        if (src_full && (logical || panel) && a509Present(s,logical?(uint32_t)fOffX:0,logical?(uint32_t)fOffY:0)) {
+-            s->release();return true;
++        // A cropped or displaced layer must go through the rectangle-aware compositor
++        // even if the backing surface is large enough for the CPU scanout shortcut.
++        if (!src_full || !(logical || panel)) {
++            s->release();
++            return false;
++        }
++        if (a509Present(s, logical ? (uint32_t)fOffX : 0, logical ? (uint32_t)fOffY : 0)) {
++            s->release();
++            return true;
+         }
+     }
+ 	if (s->scanoutPhys != 0 && s->bytesPerElement == 4 &&

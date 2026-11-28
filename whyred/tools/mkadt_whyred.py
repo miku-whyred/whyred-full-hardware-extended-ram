@@ -130,9 +130,9 @@ def build():
     if fw_dir:
         import hashlib
         from pathlib import Path
-        hashes = {'a512_zap.b00': '5302ecf8978c825bdc9d8455a828a4ac1e1d762cf09ff821f9f506fb89a549e5', 'a512_zap.b01': 'd96c83059cccd4220cee069ac58d5883f7fda667c879f01c69b1c0343e4f8525', 'a512_zap.b02': '668cbf86efe383d86ab7821ae4c5cbe4d1bcd145df454a31d3a68dbfc7ae49a4', 'a512_zap.mdt': '3ee9e6ec51b205894340a41fa4d335794c256952f3bf028e82a76d6f8efc7fe7', 'a530_pfp.fw': '2a51c25b1f7299cb84c3685d3d1fb88bf0504494456345b2dfde32816e13bc8e', 'a530_pm4.fw': 'a02c9be11787472d4ab0173ed8552afbde1f31b1e81bcd87adf1fcea97b6115f'}
+        from display_inputs import GPU_FIRMWARE_SHA256
         fw_props = []
-        for name, expected in hashes.items():
+        for name, expected in GPU_FIRMWARE_SHA256.items():
             blob = (Path(fw_dir) / name).read_bytes()
             if hashlib.sha256(blob).hexdigest() != expected:
                 raise ValueError("Unexpected A509 firmware SHA256: " + name)
