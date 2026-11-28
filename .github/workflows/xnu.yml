@@ -22,6 +22,7 @@ on:
     branches: [main, "whyred/**"]
     paths:
       - "xnu/patches/**"
+      - "xnu/whyred-fd509/**"
       - ".github/workflows/xnu.yml"
 
 
@@ -45,6 +46,14 @@ env:
 
 jobs:
   build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - flavor: display
+            suffix: ""
+          - flavor: fd509
+            suffix: "-fd509"
     # macos-14 still ships Xcode 15.x: its iig matches the xnu-8796 IORPC ABI
     # (Xcode 16's iig emits IORPC.kernelContent, which this xnu lacks)
     runs-on: ${{ inputs.runner || 'macos-15' }}
@@ -58,7 +67,14 @@ jobs:
           git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
           git -C dxb checkout -q FETCH_HEAD
           # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
-          cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          if [[ "${{ matrix.flavor }}" == fd509 ]]; then
+            git init -q upstream
+            git -C upstream fetch -q --depth 1 https://github.com/m-obeid/ios-whyred.git 9b18976b9022fd244eda02071a342a3621b7862b
+            git -C upstream checkout -q FETCH_HEAD
+            cp upstream/xnu/patches/*.patch upstream/xnu/patches/*.sh xnu/whyred-fd509/*.patch dxb/patches/
+          else
+            cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+          fi
           # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64.
           # topaz: Cortex-A53/A73 (ARMv8.0), so the same -mcpu as the kernel
           # (clang's apple-m1 default emits LSE atomics and LDAPR)
@@ -94,8 +110,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.ccache
-          key: ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/patches/**', '.github/workflows/xnu.yml') }}
+          key: ccache-${{ matrix.flavor }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-${{ hashFiles('xnu/patches/**', 'xnu/whyred-fd509/**', '.github/workflows/xnu.yml') }}
           restore-keys: |
+            ccache-${{ matrix.flavor }}-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
             ccache-${{ env.MACHINE_CONFIG }}-${{ env.KERNEL_CONFIG }}-
 
       - name: Build
@@ -126,7 +143,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-buildtree
+          name: xnu-buildtree${{ matrix.suffix }}
           path: buildtree.tgz
           retention-days: 7
 
@@ -142,6 +159,16 @@ jobs:
           done
           ls -la out/kdk-libs
 
+      - name: Build matching whyred UI bridge
+        if: matrix.flavor == 'fd509'
+        run: |
+          mkdir -p out
+          xcrun --sdk iphoneos clang -arch arm64 -mios-version-min=16.0 -O2 -ffreestanding -fno-stack-protector \
+            -fvisibility=hidden -dynamiclib -install_name /usr/lib/whyred_ui.dylib upstream/whyred/userland/whyred_ui.c \
+            -framework IOKit -framework CoreFoundation -framework AudioToolbox -lobjc -o out/whyred_ui.dylib
+          codesign -f -s - out/whyred_ui.dylib
+          (cd out && shasum -a 256 whyred_ui.dylib > WHYRED_UI_SHA256SUMS)
+
       - name: Collect
         if: always()
         run: |
@@ -153,6 +180,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: xnu-kernel
+          name: xnu-kernel${{ matrix.suffix }}
           path: out/
           if-no-files-found: warn

@@ -1,0 +1,616 @@
+diff --git a/bsd/dev/sweet_syna.c b/bsd/dev/sweet_syna.c
+--- a/bsd/dev/sweet_syna.c
++++ b/bsd/dev/sweet_syna.c
+@@ -24,7 +24,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+-extern void sweet_hid_key(int key, int down);         /* SweetHID.cpp: 0 power, 1 volume up, 2 volume down, 3 home */
++extern void sweet_hid_key(int key, int down);
+ void sweet_syna_init(void);
+ 
+ /* GCC (gcc-sdm660.c) */
+@@ -86,6 +86,7 @@
+ static vm_offset_t gcc, qup, tlmm_s, tlmm_n_66, tlmm_n_67;
+ static unsigned in_fifo, out_fifo;
+ static int syna_mode, syna_chan;
++static uint32_t syna_started;
+ static uint32_t maxx = 1080, maxy = 2160, flip;
+ 
+ static inline uint32_t rd(vm_offset_t b, uint32_t o) { uint32_t v = *(volatile uint32_t *)(b + o); __asm__ volatile("dmb oshld" ::: "memory"); return v; }
+@@ -334,6 +335,8 @@
+ static bool
+ rmi_scan(void)
+ {
++	bzero(&f01, sizeof(f01));
++	bzero(&f12, sizeof(f12));
+ 	uint8_t page0 = 0;
+ 	int e = rmi_write(0xff, &page0, 1);
+ 	if (e) {
+@@ -362,8 +365,8 @@
+ 	return f01.num == 0x01 && f12.num == 0x12;
+ }
+ 
+-static void
+-rmi_info(void)
++static bool
++rmi_configure(uint16_t *object_reg)
+ {
+ 	uint8_t q[21] = {0}, st = 0, ctl = 0, f12q[8] = {0};
+ 	if (!rmi_read(f01.query, q, sizeof(q))) {
+@@ -374,18 +377,36 @@
+ 		id[10] = 0;
+ 		printf("WHYRED TOUCH: F01 manufacturer %u product \"%s\"\n", q[0], id);
+ 	}
+-	(void)rmi_read(f01.data, &st, 1);
+-	(void)rmi_read(f01.control, &ctl, 1);
++	if (rmi_read(f01.data, &st, 1) || (st & 0x40u) || rmi_read(f01.control, &ctl, 1)) {
++		return false;
++	}
+ 	printf("WHYRED TOUCH: F01 status %#x (code %u%s%s) ctrl0 %#x\n", st, st & 0xfu,
+ 	    (st & 0x40u) ? ", bootloader" : "", (st & 0x80u) ? ", unconfigured" : "", ctl);
+-	if (st & 0x80u) {
+-		uint8_t c = (uint8_t)(ctl | 0x80u);     /* configured, as rmi_f01 does after reset */
+-		(void)rmi_write(f01.control, &c, 1);
++	/* F01 control 0: configured, normal operation. Preserve the other controls. */
++	uint8_t awake = (uint8_t)((ctl & ~3u) | 0x80u);
++	if (((st & 0x80u) || awake != ctl) && rmi_write(f01.control, &awake, 1)) {
++		return false;
++	}
++	uint8_t query_size = 0, presence[2];
++	if (f12.query > 0xf5 || rmi_read(f12.query + 7, &query_size, 1)) {
++		return false;
++	}
++	/* With no presence bitmap the DSX driver uses Data1 at the data base. */
++	*object_reg = f12.data;
++	if (query_size >= sizeof(presence)) {
++		if (rmi_read(f12.query + 8, presence, sizeof(presence)) || !(presence[1] & 2u)) {
++			return false;
++		}
++		*object_reg += presence[1] & 1u;
++	}
++	if (*object_reg >= 0xff) {
++		return false;
+ 	}
+ 	if (!rmi_read(f12.query, f12q, sizeof(f12q))) {
+ 		printf("WHYRED TOUCH: F12 query %02x %02x %02x %02x %02x %02x %02x %02x\n",
+ 		    f12q[0], f12q[1], f12q[2], f12q[3], f12q[4], f12q[5], f12q[6], f12q[7]);
+ 	}
++	return true;
+ }
+ 
+ static void
+@@ -446,6 +467,27 @@
+ SYSCTL_PROC(_kern, OID_AUTO, whyred_touch, CTLTYPE_QUAD | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0,
+     whyred_touch_sysctl, "Q", "inject a one-finger touch: x1 | y1<<12 | x2<<24 | y2<<36 | ms<<48");
+ 
++static unsigned
++syna_discover(uint16_t *object_reg)
++{
++	if (!clocks_on()) {
++		return 0;
++	}
++	pins();
++	uint32_t io = rd(qup, QUP_IO_MODE);
++	if (io == 0xffffffffu) {
++		return 0;
++	}
++	static const unsigned blk[4] = { 4, 16, 32, 4 };
++	out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
++	in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
++	if (in_fifo < 10 || out_fifo < 6 || !rmi_scan() || !rmi_configure(object_reg)) {
++		return 0;
++	}
++	unsigned count = (in_fifo - 2) / 8;
++	return count > SYNA_MAX_OBJ ? SYNA_MAX_OBJ : count;
++}
++
+ /*
+  * whyred: synthetic button presses for remote use (whyred/tools/remote): sysctl kern.whyred_key = key | ms << 8.
+  * Keys as sweet_hid_key: 0 power, 1 volume up, 2 volume down, 3 home. Held ms (default 80), then let go.
+@@ -475,38 +517,36 @@
+ static void
+ syna_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+-	sleep_ms(20000);        /* after the UDP log and SpringBoard are up */
+-	if (!clocks_on()) {
+-		return;
+-	}
+-	pins();
+-	uint32_t io = rd(qup, QUP_IO_MODE);
+-	static const unsigned blk[4] = { 4, 16, 32, 4 };
+-	out_fifo = blk[io & 3u] * (2u << ((io >> 2) & 7u));
+-	in_fifo = blk[(io >> 5) & 3u] * (2u << ((io >> 7) & 7u));
+-	printf("WHYRED TOUCH: QUP hw %#x io_mode %#x (fifo out %u in %u) state %#x\n",
+-	    rd(qup, QUP_HW_VERSION), io, out_fifo, in_fifo, rd(qup, QUP_STATE));
+-	if (!rmi_scan()) {
+-		printf("WHYRED TOUCH: F01/F12 not found\n");
+-		return;
+-	}
+-	rmi_info();
+-
+-	unsigned nobj = (in_fifo - 2) / 8;
+-	nobj = nobj > SYNA_MAX_OBJ ? SYNA_MAX_OBJ : nobj;
+-	printf("WHYRED TOUCH: polling F12 data %#x, %u objects, mode %d, range %ux%u flip %#x\n",
+-	    f12.data, nobj, syna_mode, maxx, maxy, flip);
++	sleep_ms(20000);
++	uint16_t object_reg = 0;
++	unsigned nobj = 0, errors = 0, retry_ms = 250;
+ 	uint8_t prev[SYNA_MAX_OBJ * 8] = {0}, d[SYNA_MAX_OBJ * 8];
+-	unsigned errors = 0;
+ 	for (;;) {
+-		int e = rmi_read(f12.data, d, nobj * 8);
++		if (!nobj) {
++			nobj = syna_discover(&object_reg);
++			if (!nobj) {
++				sleep_ms(retry_ms);
++				retry_ms = MIN(2 * retry_ms, 30000u);
++				continue;
++			}
++			retry_ms = 250;
++			printf("WHYRED TOUCH: polling F12 data %#x, %u objects, mode %d\n",
++			    object_reg, nobj, syna_mode);
++		}
++		int e = rmi_read(object_reg, d, nobj * 8);
+ 		if (e) {
+-			if ((errors++ % 500u) == 0) {
+-				printf("WHYRED TOUCH: F12 read error %d\n", e);
++			if (++errors == 5) {
++				printf("WHYRED TOUCH: F12 read error %d, rediscovering\n", e);
++				if (syna_mode == 2) {
++					report(0, NULL, NULL);
++				}
++				bzero(prev, sizeof(prev));
++				nobj = errors = 0;
+ 			}
+ 			sleep_ms(50);
+ 			continue;
+ 		}
++		errors = 0;
+ 		if (inj_req != 0) {
+ 			uint64_t r = inj_req;
+ 			inj_req = 0;
+@@ -572,6 +612,9 @@
+ 	if (mode == 0 || maxx == 0 || maxy == 0) {
+ 		return;
+ 	}
++	if (__atomic_exchange_n(&syna_started, 1, __ATOMIC_ACQ_REL)) {
++		return;
++	}
+ 	syna_mode = mode;
+ 	gcc = ml_io_map(GCC_PA, GCC_SIZE);
+ 	qup = ml_io_map(QUP_PA, 0x1000);
+@@ -580,11 +623,14 @@
+ 	tlmm_n_67 = ml_io_map(TLMM_NORTH + 0x1000u * 67, 0x1000);
+ 	if (!gcc || !qup || !tlmm_s || !tlmm_n_66 || !tlmm_n_67) {
+ 		printf("WHYRED TOUCH: MMIO mapping failed\n");
++		__atomic_store_n(&syna_started, 0, __ATOMIC_RELEASE);
+ 		return;
+ 	}
+ 	thread_t t;
+ 	if (kernel_thread_start(syna_thread, NULL, &t) == KERN_SUCCESS) {
+ 		thread_deallocate(t);
++	} else {
++		__atomic_store_n(&syna_started, 0, __ATOMIC_RELEASE);
+ 	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/whyred_gpu.c b/bsd/dev/whyred_gpu.c
+--- a/bsd/dev/whyred_gpu.c
++++ b/bsd/dev/whyred_gpu.c
+@@ -37,6 +37,8 @@
+  */
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/errno.h>
++#include <pexpert/device_tree.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <mach/mach_time.h>
+@@ -163,8 +165,19 @@
+ static uint32_t ring_w;                 /* next ring dword */
+ static bool zap_ok;
+ static uint32_t pfp_ver, pm4_ver;
+-int topaz_fw_read(const char *path, void **data, size_t *size);
+-void topaz_fw_free(void *data, size_t size);
++/* The boot image supplies the firmware as immutable ADT properties. */
++static int
++whyred_fw_read(const char *name, const void **data, size_t *size)
++{
++	DTEntry entry;
++	unsigned int len;
++	if (SecureDTLookupEntry(NULL, "/whyred-gpu-firmware", &entry) != kSuccess ||
++	    SecureDTGetProperty(entry, name, data, &len) != kSuccess || len == 0 || len > 0x100000u) {
++		return ENOENT;
++	}
++	*size = len;
++	return 0;
++}
+ int topaz_root_mounted(void);
+ uint64_t topaz_scm(uint32_t fn, uint64_t arginfo, uint64_t a, uint64_t b, uint64_t c, uint64_t *res1);
+ static int gpu_steps;
+@@ -585,12 +598,11 @@
+ static bool
+ load_ucode(const char *path, uint32_t off, uint32_t *ver)
+ {
+-	void *data = NULL;
++	const void *data = NULL;
+ 	size_t size = 0;
+-	int err = topaz_fw_read(path, &data, &size);
++	int err = whyred_fw_read(path, &data, &size);
+ 	if (err || size < 8 || (size & 3) || size - 4 > 0x10000) {
+ 		printf("WHYRED GPU: %s: error %d, %u bytes\n", path, err, (unsigned)size);
+-		topaz_fw_free(data, size);
+ 		return false;
+ 	}
+ 	const uint32_t *w = (const uint32_t *)data;
+@@ -599,7 +611,6 @@
+ 	}
+ 	*ver = size > 12 ? w[2] : 0;
+ 	printf("WHYRED GPU: %s: %u bytes at %#x, words %#x %#x %#x\n", path, (unsigned)size, GMEM_PA + off, w[0], w[1], w[2]);
+-	topaz_fw_free(data, size);
+ 	return true;
+ }
+ 
+@@ -610,8 +621,8 @@
+ 		gpu_ms(100);
+ 	}
+ 	say("step 8: microcode and ring");
+-	if (!load_ucode("/usr/share/firmware/whyred/a530_pfp.fw", PFP_OFF, &pfp_ver) ||
+-	    !load_ucode("/usr/share/firmware/whyred/a530_pm4.fw", PM4_OFF, &pm4_ver)) {
++	if (!load_ucode("a530_pfp.fw", PFP_OFF, &pfp_ver) ||
++	    !load_ucode("a530_pm4.fw", PM4_OFF, &pm4_ver)) {
+ 		return false;
+ 	}
+ 	for (uint32_t i = 0; i < 0x2000; i += 4) {
+@@ -644,16 +655,21 @@
+ static bool
+ step9(void)
+ {
+-	void *mdt = NULL, *seg = NULL;
++	const void *mdt = NULL, *seg = NULL;
+ 	size_t mdt_size = 0, seg_size = 0;
+ 	uint64_t st, res = 0;
+ 	bool ok = false;
+ 	say("step 9: zap shader through TrustZone (PAS 13)");
+-	if (topaz_fw_read("/usr/share/firmware/whyred/a512_zap.mdt", &mdt, &mdt_size) || mdt_size < sizeof(struct z_ehdr)) {
++	if (whyred_fw_read("a512_zap.mdt", &mdt, &mdt_size) || mdt_size < sizeof(struct z_ehdr)) {
+ 		printf("WHYRED GPU: a512_zap.mdt not readable\n");
+ 		goto out;
+ 	}
+ 	const struct z_ehdr *eh = (const struct z_ehdr *)mdt;
++	if (eh->phentsize != sizeof(struct z_phdr) || eh->phnum == 0 || eh->phnum > 8 ||
++	    eh->phoff > mdt_size || (eh->phoff & 3) != 0 ||
++	    eh->phnum > (mdt_size - eh->phoff) / sizeof(struct z_phdr)) {
++		goto out;
++	}
+ 	const struct z_phdr *ph = (const struct z_phdr *)((const uint8_t *)mdt + eh->phoff);
+ 	uint32_t hash = ~0u, load = ~0u;
+ 	for (uint32_t i = 0; i < eh->phnum && i < 8; i++) {
+@@ -666,14 +682,16 @@
+ 			load = i;
+ 		}
+ 	}
+-	if (hash == ~0u || load == ~0u || ph[load].memsz > META_OFF - ZAP_OFF) {
++	if (hash == ~0u || load == ~0u || ph[load].memsz > META_OFF - ZAP_OFF ||
++	    ph[load].filesz > ph[load].memsz || (ph[load].filesz & 3) != 0) {
+ 		printf("WHYRED GPU: zap: hash %u load %u, not usable\n", hash, load);
+ 		goto out;
+ 	}
+ 	uint32_t hsz = eh->phoff + (uint32_t)eh->phnum * sizeof(struct z_phdr);
+ 	/* the hash segment sits at its file offset in a full ELF, right behind the headers in a split .mdt */
+-	uint32_t hoff = ph[hash].offset + ph[hash].filesz <= mdt_size ? ph[hash].offset : hsz;
+-	if (hoff + ph[hash].filesz > mdt_size || hsz + ph[hash].filesz > 0x10000) {
++	uint32_t hoff = (uint64_t)ph[hash].offset + ph[hash].filesz <= mdt_size ? ph[hash].offset : hsz;
++	if (((hoff | ph[hash].filesz) & 3) != 0 || (uint64_t)hoff + ph[hash].filesz > mdt_size ||
++	    (uint64_t)hsz + ph[hash].filesz > 0x10000) {
+ 		printf("WHYRED GPU: zap: hash segment outside the .mdt\n");
+ 		goto out;
+ 	}
+@@ -695,7 +713,7 @@
+ 	if (st != 0 || res != 0) {
+ 		goto shutdown;
+ 	}
+-	if (topaz_fw_read("/usr/share/firmware/whyred/a512_zap.b02", &seg, &seg_size) || seg_size != ph[load].filesz) {
++	if (whyred_fw_read("a512_zap.b02", &seg, &seg_size) || seg_size != ph[load].filesz) {
+ 		printf("WHYRED GPU: a512_zap.b02 not readable or %u bytes (want %#x)\n", (unsigned)seg_size, ph[load].filesz);
+ 		goto shutdown;
+ 	}
+@@ -713,11 +731,9 @@
+ 	st = topaz_scm(0x42000206u, 1, 13, 0, 0, &res);         /* SHUTDOWN */
+ 	printf("WHYRED GPU: PAS 13 shutdown after failure: ret %#llx res %#llx\n", st, res);
+ out:
+-	topaz_fw_free(mdt, mdt_size);
+-	topaz_fw_free(seg, seg_size);
+ 	zap_ok = ok;
+ 	printf("WHYRED GPU: zap %s, secvid trust cntl %#x\n", ok ? "loaded" : "NOT loaded", grd(A5_SECVID_TRUST_CNTL));
+-	return true;                            /* step 10 falls back to the register without a zap */
++	return ok;                              /* require successful firmware authentication */
+ }
+ 
+ static bool
+@@ -837,7 +853,7 @@
+  * mode, the write went to 0x71714000 and the phone reset).
+  */
+ uint64_t whyred_high_page(volatile uint32_t **va);     /* WhyredAdreno.cpp */
+-void whyred_gpu_vm_start(void);
++bool whyred_gpu_vm_start(void);
+ void sweet_dcache_flush(vm_offset_t addr, unsigned length);   /* osfmk/arm/caches.c: clean + invalidate */
+ void whyred_high_page_free(void);
+ 
+@@ -881,6 +897,23 @@
+ 	whyred_high_page_free();
+ }
+ 
++/* Access needed by the command processor after the private address space is active. */
++unsigned whyred_gpu_control_access(uint64_t address);
++unsigned
++whyred_gpu_control_access(uint64_t address)
++{
++	if (address == GMEM_PA + FENCE_OFF) {
++		return 2;
++	}
++	if ((address >= GMEM_PA + PFP_OFF && address < GMEM_PA + PFP_OFF + 0x10000) ||
++	    (address >= GMEM_PA + PM4_OFF && address < GMEM_PA + PM4_OFF + 0x10000) ||
++	    (address >= GMEM_PA + RING_OFF && address < GMEM_PA + RING_OFF + RING_DW * 4) ||
++	    address == GMEM_PA + IB_OFF) {
++		return 1;
++	}
++	return 0;
++}
++
+ static void
+ gpu_thread(__unused void *arg, __unused wait_result_t wr_)
+ {
+@@ -903,10 +936,11 @@
+ 	}
+ 	uint32_t vm = 0;
+ 	(void)PE_parse_boot_argn("whyredgpuvm", &vm, sizeof(vm));
+-	if (n == 12 && gpu_64 && vm != 0) {
+-		whyred_gpu_vm_start();          /* WhyredAdreno.cpp: page tables, then identity off if they work */
+-	}
+ 	if (n == 12 && gpu_svc) {
++		if (!gpu_64 || !vm || !whyred_gpu_vm_start()) {
++			printf("WHYRED GPU: restricted translation unavailable; keeping render service offline\n");
++			return;
++		}
+ 		gpu_seq = *gmw(FENCE_OFF + 0x40);
+ 		gpu_up = true;
+ 		RedwoodGPUStart();
+diff --git a/iokit/Kernel/arm/RedwoodGPU.cpp b/iokit/Kernel/arm/RedwoodGPU.cpp
+--- a/iokit/Kernel/arm/RedwoodGPU.cpp
++++ b/iokit/Kernel/arm/RedwoodGPU.cpp
+@@ -43,6 +43,7 @@
+ #include <mach/vm_param.h>
+ #include <sys/systm.h>
+ #include <sys/proc.h>
++#include <sys/vnode.h>
+ 
+ #include "SweetSurface.h"
+ 
+@@ -461,10 +462,44 @@
+ 
+ OSDefineMetaClassAndStructors(RedwoodGPUUserClient, IOUserClient);
+ 
++/* Until contexts are isolated per task, only the platform compositor and the root diagnostic may open one. */
++static bool
++whyredRenderClient(task_t task)
++{
++	if (task != current_task()) {
++		return false;
++	}
++	proc_t process = proc_self();
++	if (process == PROC_NULL) {
++		return false;
++	}
++	vnode_t executable = proc_getexecutablevnode(process);
++	proc_rele(process);
++	if (executable == NULL) {
++		return false;
++	}
++	const char *const paths[] = {
++		"/usr/libexec/backboardd", "/usr/libexec/real/backboardd", "/topaz/backboardd", "/var/root/gltest"
++	};
++	bool allow = false;
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		vnode_t allowed = NULL;
++		if (vnode_lookup(paths[i], 0, &allowed, vfs_context_kernel()) == 0) {
++			allow = executable == allowed;
++			vnode_put(allowed);
++			if (allow) {
++				break;
++			}
++		}
++	}
++	vnode_put(executable);
++	return allow;
++}
++
+ bool
+ RedwoodGPUUserClient::initWithTask(task_t owningTask, void * securityID, UInt32 type, OSDictionary * properties)
+ {
+-	if (!IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
++	if (!whyredRenderClient(owningTask) || !IOUserClient::initWithTask(owningTask, securityID, type, properties)) {
+ 		return false;
+ 	}
+ 	fTask = owningTask;
+diff --git a/iokit/Kernel/arm/WhyredAdreno.cpp b/iokit/Kernel/arm/WhyredAdreno.cpp
+--- a/iokit/Kernel/arm/WhyredAdreno.cpp
++++ b/iokit/Kernel/arm/WhyredAdreno.cpp
+@@ -34,7 +34,8 @@
+ void whyred_gpu_vm_disable(void);
+ void whyred_gpu_tlb_flush(void);
+ bool whyred_gpu_vm_write_test(uint64_t address, volatile uint32_t *cpu, uint32_t word);
+-void whyred_gpu_vm_start(void);
++bool whyred_gpu_vm_start(void);
++unsigned whyred_gpu_control_access(uint64_t address);
+ 
+ void topaz_adreno_init(void);
+ bool redwood_gpu_ready(void);
+@@ -61,6 +62,7 @@
+ }
+ 
+ #define GPU_POOL_BASE       0xa2000000ull
++#define GPU_TABLE_RESERVE   (16ull << 20)      /* CPU and SMMU walker only */
+ #define GPU_POOL_UNIT       0x10000ull          /* 64 KiB */
+ #define GPU_POOL_CHUNK      0x4000000ull        /* 64 MiB, each mapped on first use */
+ #define GPU_POOL_CHUNKS     32                  /* at most 2 GiB */
+@@ -171,7 +173,8 @@
+ 	if (!pool_ready) {
+ 		/* one range per chunk, a unit short so that neighbours never merge: no buffer crosses a chunk */
+ 		for (uint64_t c = 0; c < gpu_pool_size / GPU_POOL_CHUNK; c++) {
+-			range_free(GPU_POOL_BASE + c * GPU_POOL_CHUNK, GPU_POOL_CHUNK - GPU_POOL_UNIT);
++			uint64_t reserve = c == 0 ? GPU_TABLE_RESERVE : 0;
++			range_free(GPU_POOL_BASE + c * GPU_POOL_CHUNK + reserve, GPU_POOL_CHUNK - GPU_POOL_UNIT - reserve);
+ 		}
+ 		pool_ready = true;
+ 	}
+@@ -220,7 +223,8 @@
+ topaz_gpu_pool_free(uint64_t pa, uint64_t size)
+ {
+ 	size = (size + GPU_POOL_UNIT - 1) & ~(GPU_POOL_UNIT - 1);
+-	if (pool_lock == NULL || pa < GPU_POOL_BASE || pa + size > GPU_POOL_BASE + gpu_pool_size) {
++	if (pool_lock == NULL || pa < GPU_POOL_BASE + GPU_TABLE_RESERVE || pa >= GPU_POOL_BASE + gpu_pool_size ||
++	    size > GPU_POOL_BASE + gpu_pool_size - pa) {
+ 		return;
+ 	}
+ 	IOLockLock(pool_lock);
+@@ -259,15 +263,13 @@
+  * (3623 copies against 77 shared in one session). With them RedwoodGPU's translated path runs: buffers are
+  * ordinary cached kernel memory and every 4 KiB page is entered into the table.
+  *
+- * One table for everything, 36-bit addresses, 4 KiB granule. GPU 0-4 GiB maps 1:1 in four 1 GiB blocks (the
+- * kernel's ring, firmware and fence page at 0xa1400000, the pool). GPU 4-8 GiB is the window RedwoodGPU's
+- * buffers get addresses in: four level 2 tables and 2048 level 3 tables, all made up front (8 MiB of pool).
+- * Each buffer gets one unmapped 4 KiB page behind it: a GPU overrun faults instead of writing the next buffer.
++ * The low aperture maps the GPU pool and the specific firmware, ring and fence pages.
++ * The 4-8 GiB window maps client buffers with a guard page. Translation tables stay CPU-only.
+  */
+ #define VM_WINDOW           0x100000000ull      /* GPU 4 GiB */
+ #define VM_WINDOW_SIZE      0x100000000ull      /* 4 GiB */
+ #define VM_PAGE             0x1000ull
+-#define VM_TABLES_SIZE      (0x1000ull + 4 * 0x1000ull + 2048 * 0x1000ull)
++#define VM_TABLES_SIZE      ((1 + 4 + 2 + 4 + 2048) * VM_PAGE)
+ #define PTE_AF              (1ull << 10)
+ #define PTE_SH_OUTER        (2ull << 8)
+ #define PTE_AP_UNPRIV       (1ull << 6)
+@@ -331,30 +333,57 @@
+ 	return &vm_l3[(address - VM_WINDOW) / VM_PAGE];
+ }
+ 
+-/* The table, from the pool (write-combined: what is written is in memory after a barrier). */
++/* Keep translation tables outside every GPU-visible mapping. Entirely unmapped entries fault. */
+ static bool
+ vm_build(void)
+ {
+-	void *va = NULL;
+-	vm_tables_pa = topaz_gpu_pool_alloc(VM_TABLES_SIZE, &va);
+-	if (vm_tables_pa == 0) {
+-		IOLog("WhyredAdreno: vm: no %llu KiB of pool for the tables\n", VM_TABLES_SIZE >> 10);
++	const uint64_t block = 2ull << 20, control = 0xa1400000ull;
++	if (gpu_pool_size < GPU_POOL_CHUNK || GPU_POOL_BASE + gpu_pool_size > VM_WINDOW ||
++	    VM_TABLES_SIZE > GPU_TABLE_RESERVE) {
+ 		return false;
+ 	}
++	vm_lock = IOLockAlloc();
++	if (vm_lock == NULL) {
++		return false;
++	}
++	vm_tables_pa = GPU_POOL_BASE;
++	IOMemoryDescriptor *md = topaz_gpu_pool_md(vm_tables_pa, VM_TABLES_SIZE);
++	IOMemoryMap *tables = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);
++	if (tables == NULL) {
++		IOLockFree(vm_lock);
++		vm_lock = NULL;
++		return false;
++	}
++	/* The kernel retains the map while the SMMU walks these tables. */
++	void *va = (void *)tables->getVirtualAddress();
+ 	bzero(va, (size_t)VM_TABLES_SIZE);
+ 	vm_l1 = (volatile uint64_t *)va;
+-	volatile uint64_t *l2 = vm_l1 + 512;
+-	vm_l3 = l2 + 4 * 512;
+-	uint64_t l2_pa = vm_tables_pa + 0x1000, l3_pa = l2_pa + 4 * 0x1000;
++	volatile uint64_t *low = vm_l1 + 512;
++	volatile uint64_t *controls = low + 4 * 512;
++	volatile uint64_t *high = controls + 2 * 512;
++	vm_l3 = high + 4 * 512;
+ 	for (uint64_t g = 0; g < 4; g++) {
+-		vm_l1[g] = (g << 30) | PTE_ATTRS | 1;                           /* 1 GiB block, 1:1 */
+-		vm_l1[4 + g] = (l2_pa + g * 0x1000) | 3;                        /* table */
++		vm_l1[g] = (vm_tables_pa + (1 + g) * VM_PAGE) | 3;
++		vm_l1[4 + g] = (vm_tables_pa + (7 + g) * VM_PAGE) | 3;
++	}
++	for (uint64_t i = 0; i < 2; i++) {
++		low[control / block + i] = (vm_tables_pa + (5 + i) * VM_PAGE) | 3;
++	}
++	for (uint64_t i = 0; i < 2 * 512; i++) {
++		uint64_t pa = control + i * VM_PAGE;
++		unsigned access = whyred_gpu_control_access(pa);
++		if (access != 0) {
++			controls[i] = pa | PTE_ATTRS | (access == 1 ? PTE_AP_RDONLY : 0) | 3;
++		}
++	}
++	for (uint64_t pa = GPU_POOL_BASE + GPU_TABLE_RESERVE; pa < GPU_POOL_BASE + gpu_pool_size; pa += block) {
++		low[pa / block] = pa | PTE_ATTRS | 1;
+ 	}
+ 	for (uint64_t i = 0; i < 4 * 512; i++) {
+-		l2[i] = (l3_pa + i * 0x1000) | 3;
++		high[i] = (vm_tables_pa + (11 + i) * VM_PAGE) | 3;
+ 	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+-	vm_lock = IOLockAlloc();
+ 	vm_free_count = 0;
+ 	vm_range_free(VM_WINDOW, VM_WINDOW_SIZE);
+ 	IOLog("WhyredAdreno: vm: tables at %#llx (L1, 4 L2, 2048 L3), window %#llx + %llu MiB\n", vm_tables_pa, VM_WINDOW,
+@@ -362,21 +391,12 @@
+ 	return true;
+ }
+ 
+-/*
+- * From whyred_gpu.c before RedwoodGPU is published: build the table, turn translation on (fences through the 1:1
+- * part checked there), then map one kernel page into the window and let the GPU write to it. Any failure turns
+- * translation off again: the identity path stays.
+- */
+-void
++/* Publish the userspace service only after both a translated fence and an owned-page test pass. */
++bool
+ whyred_gpu_vm_start(void)
+ {
+-	if (!vm_build()) {
+-		return;
+-	}
+-	if (!whyred_gpu_vm_enable(vm_tables_pa)) {
+-		whyred_gpu_vm_disable();
+-		IOLog("WhyredAdreno: vm: fences failed with translation on, staying 1:1\n");
+-		return;
++	if (!vm_build() || !whyred_gpu_vm_enable(vm_tables_pa)) {
++		return false;
+ 	}
+ 	IOBufferMemoryDescriptor *page = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task, kIODirectionInOut, 16384, 16384);
+ 	uint64_t pa = page != NULL ? page->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) : 0;
+@@ -397,11 +417,8 @@
+ 	}
+ 	IOLog("WhyredAdreno: vm: test page at %#llx as GPU %#llx: %s\n", pa, gva, ok ? "translation works" : "FAILED");
+ 	OSSafeReleaseNULL(page);
+-	if (!ok) {
+-		whyred_gpu_vm_disable();
+-		return;
+-	}
+-	vm_on = true;
++	vm_on = ok;
++	return ok;
+ }
+ 
+ bool
+@@ -468,7 +485,8 @@
+ 	if (!vm_on) {
+ 		return true;
+ 	}
+-	if (address < VM_WINDOW || address >= VM_WINDOW + VM_WINDOW_SIZE || (phys & (VM_PAGE - 1)) != 0 ||
++	if (address < VM_WINDOW || address >= VM_WINDOW + VM_WINDOW_SIZE || (address & (VM_PAGE - 1)) != 0 ||
++	    (phys < GPU_POOL_BASE + GPU_TABLE_RESERVE) || (phys & (VM_PAGE - 1)) != 0 ||
+ 	    phys >= (1ull << 36)) {
+ 		return false;
+ 	}
